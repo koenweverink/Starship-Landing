@@ -1,0 +1,8 @@
+# Ignore orekit virtual environment
+orekit-env/
+
+# Ignore orekit data archive
+orekit-data.zip
+
+# Python cache and compiled files
+__pycache__/
