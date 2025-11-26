@@ -197,6 +197,9 @@ def simulate_landing_once(
         # B. Guidance Command (The Prediction)
         t_go = guidance.compute_tgo(r, v, min_tgo=2.0)
         a_cmd = guidance.compute_accel(r, v, t_go)
+
+        # Keep an updated ballistic estimate every cycle (used by staging and braking)
+        t_ballistic = estimate_ballistic_time_to_ground(r, v, g_vec)
         
         # C. Required Thrust (The Prediction in physical units)
         # T_thrust = m*(a_cmd + g)
@@ -213,7 +216,6 @@ def simulate_landing_once(
         # Step 1: Initial Ignition (Free Fall -> Stage 3, or 2 if 3 is too much)
         if not engines_on:
             # Only consider ignition when we're falling and guidance calls for real thrust
-            t_ballistic = estimate_ballistic_time_to_ground(r, v, g_vec)
             a_net_max3 = (3 * THROTTLE_MAX * T_ENGINE_MAX) / m + g_vec[2]
             burn_margin = 1.1
             t_brake_max3 = (-v[2] / a_net_max3) if a_net_max3 > 1e-6 else np.inf
@@ -243,18 +245,25 @@ def simulate_landing_once(
         if engines_on:
             # Stage-down decisions rely on whether the lower stage can still null velocity
             # before hitting the ground (with a safety margin) while avoiding thrashing.
-            min_dwell = 0.5  # seconds to stay in a stage before considering another drop
+            min_dwell = 1.5  # seconds to stay in a stage before considering another drop
+            burn_window = 2.5  # ensure there's enough time to use the next stage
 
             def stage_safe_to_drop(n_engines_target):
                 T_max_target = n_engines_target * THROTTLE_MAX * T_ENGINE_MAX
+                T_min_target = n_engines_target * THROTTLE_MIN * T_ENGINE_MAX
+                # Require that the desired thrust fits comfortably in the lower stage envelope
+                if not (0.6 * T_min_target <= T_req_mag <= 0.9 * T_max_target):
+                    return False
+
                 a_z_target = (T_max_target / m) + g_vec[2]
                 if a_z_target <= 1e-6:
                     return False
                 t_stop = -v[2] / a_z_target if v[2] < 0 else 0.0
                 dz_needed = v[2] * t_stop + 0.5 * a_z_target * (t_stop ** 2)
-                safety = 1.15
-                # dz_needed is negative (downwards); compare absolute distance to current alt
-                return alt > safety * abs(dz_needed) and t_ballistic > safety * t_stop
+                safety = 1.2
+                has_altitude = alt > safety * abs(dz_needed)
+                has_time = t_ballistic > max(burn_window, safety * t_stop)
+                return has_altitude and has_time
 
             # Stage Down 3->2
             if current_stage_max == 3 and (t - t_last_stage_change) >= min_dwell:
@@ -277,7 +286,7 @@ def simulate_landing_once(
                     )
 
         # Step 3: Final Cutoff (one-way switch)
-        if engines_on and alt < 10.0 and np.linalg.norm(v) < 1.0:
+        if engines_on and alt < 5.0 and np.linalg.norm(v) < 0.5:
             engines_on = False
             current_stage_max = 0
             T_req_mag = 0.0 # Force zero thrust
@@ -315,6 +324,30 @@ def simulate_landing_once(
 
         # I. Clamp thrust direction
         T_vec = clamp_thrust_direction(a_cmd, m, T_cmd_mag)
+
+        # J0. Vertical braking overlay to drive v->0 at alt->0 smoothly
+        if engines_on and alt > 0:
+            a_stop = (abs(v[2]) ** 2) / max(alt, 1.0)
+            a_stop *= 0.5  # convert to v^2/(2*alt)
+            a_stop *= 1.1  # safety factor
+            # Required thrust acceleration to realize that upward net accel
+            a_thrust_req = max(a_cmd[2], a_stop - g_vec[2])
+            # Update thrust vector magnitude to meet the higher vertical demand
+            if T_cmd_mag > 0:
+                desired_Tz = a_thrust_req * m
+                desired_Tz = np.clip(desired_Tz, dyn.thrust_min, dyn.thrust_max)
+
+                # Preserve any horizontal authority but enforce the vertical component needed
+                T_horizontal = T_vec.copy()
+                T_horizontal[2] = 0.0
+                T_vec = T_horizontal
+                T_vec[2] = desired_Tz
+
+                # Respect gimbal limits while keeping the new magnitude
+                T_vec = clamp_direction_to_cone(T_vec, np.array([0.0, 0.0, 1.0]), 20.0)
+                if np.linalg.norm(T_vec) > 1e-9:
+                    T_vec = (T_vec / np.linalg.norm(T_vec)) * min(T_cmd_mag, dyn.thrust_max)
+                    T_cmd_mag = np.linalg.norm(T_vec)
 
         # J. CRITICAL High T/W Throttle Scaling (The Hover-Lock Fix)
         # Scale thrust back if the minimum throttle would cause upward acceleration.
