@@ -182,7 +182,7 @@ def simulate_landing_once(
     # CONTROL STATES
     engines_on = False
     horizontal_done = False
-    # Explicit 0-3-2-1 staging
+    # Explicit 0-3-2-1 staging (engine count is sticky within each stage)
     current_stage_max = 0  # 0 = free fall, then 3->2->1
     
     # --- 3. Main Adaptive Loop ---
@@ -257,9 +257,10 @@ def simulate_landing_once(
                         f"T_req={T_req_mag/1e3:.1f}kN"
                     )
 
-        # Step 3: Final Cutoff
+        # Step 3: Final Cutoff (one-way switch)
         if engines_on and alt < 10.0 and np.linalg.norm(v) < 1.0:
             engines_on = False
+            current_stage_max = 0
             T_req_mag = 0.0 # Force zero thrust
 
         # F. Horizontal Freeze Logic
@@ -274,15 +275,16 @@ def simulate_landing_once(
         T_des = m * a_cmd
         T_des_mag = np.linalg.norm(T_des) if engines_on else 0.0
 
-        n_engines, T_cmd_mag = 0, 0.0
+        # Engine allocation is sticky within a stage: once a stage is selected,
+        # hold that engine count and only adjust throttle. This prevents
+        # oscillating ignitions.
         if engines_on and current_stage_max > 0:
-            n_engines, T_cmd_mag = allocate_engines_stage_limited(
-                T_des_mag,
-                T_ENGINE_MAX,
-                current_stage_max, # Uses the stage determined in (D)
-                THROTTLE_MIN,
-                THROTTLE_MAX,
-            )
+            n_engines = current_stage_max
+            stage_min = n_engines * THROTTLE_MIN * T_ENGINE_MAX
+            stage_max = n_engines * THROTTLE_MAX * T_ENGINE_MAX
+            T_cmd_mag = float(np.clip(T_des_mag, stage_min, stage_max))
+        else:
+            n_engines, T_cmd_mag = 0, 0.0
 
         # H. Apply to Dynamics (Set the min/max limits for the dynamics object)
         if n_engines == 0:
@@ -313,11 +315,7 @@ def simulate_landing_once(
                 T_vec *= scale
                 T_cmd_mag = np.linalg.norm(T_vec) # Update actual thrust magnitude
 
-                # If scaling brought thrust below min-throttle, it means the required T_cmd_mag 
-                # was scaled down to a value that would be below 1 engine's minimum. 
-                # Force n_engines to 0 if the actual thrust is near zero.
-                if T_cmd_mag < T_min_1_engine * 0.1:
-                    n_engines = 0
+
                     
         # K. Step Integration
         (r, v, m), a_actual, _ = dyn.step((r, v, m), T_vec, dt_sim)
