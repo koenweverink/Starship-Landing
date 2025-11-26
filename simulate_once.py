@@ -186,8 +186,9 @@ def simulate_landing_once(
     current_stage_max = 0  # 0 = free fall, then 3->2->1
     
     # --- 3. Main Adaptive Loop ---
-    max_duration = 100.0 
-    
+    max_duration = 100.0
+    t_last_stage_change = 0.0
+
     while r[2] > 0.1 and t < max_duration:
         
         # A. Altitude Definition (FIX: alt was undefined)
@@ -232,6 +233,7 @@ def simulate_landing_once(
 
                 engines_on = True
                 current_stage_max = preferred_stage
+                t_last_stage_change = t
                 print(
                     f"Ignition (Stage {preferred_stage}) at t={t:.2f}, Alt={alt:.1f}m, "
                     f"T_req={T_req_mag/1e3:.1f}kN"
@@ -239,19 +241,36 @@ def simulate_landing_once(
 
         # Step 2: Stage Down (3->2->1 only, never back up)
         if engines_on:
-            # Stage Down 3->2: If required thrust is below the comfortable range for 3 engines
-            if current_stage_max == 3:
-                if T_req_mag < 0.85 * T_max_2_engines:
+            # Stage-down decisions rely on whether the lower stage can still null velocity
+            # before hitting the ground (with a safety margin) while avoiding thrashing.
+            min_dwell = 0.5  # seconds to stay in a stage before considering another drop
+
+            def stage_safe_to_drop(n_engines_target):
+                T_max_target = n_engines_target * THROTTLE_MAX * T_ENGINE_MAX
+                a_z_target = (T_max_target / m) + g_vec[2]
+                if a_z_target <= 1e-6:
+                    return False
+                t_stop = -v[2] / a_z_target if v[2] < 0 else 0.0
+                dz_needed = v[2] * t_stop + 0.5 * a_z_target * (t_stop ** 2)
+                safety = 1.15
+                # dz_needed is negative (downwards); compare absolute distance to current alt
+                return alt > safety * abs(dz_needed) and t_ballistic > safety * t_stop
+
+            # Stage Down 3->2
+            if current_stage_max == 3 and (t - t_last_stage_change) >= min_dwell:
+                if stage_safe_to_drop(2):
                     current_stage_max = 2
+                    t_last_stage_change = t
                     print(
                         f"Stage Down 3->2 at t={t:.2f}, Alt={alt:.1f}m, "
                         f"T_req={T_req_mag/1e3:.1f}kN"
                     )
 
-            # Stage Down 2->1: If required thrust is below the comfortable range for 2 engines
-            if current_stage_max == 2:
-                if T_req_mag < 0.90 * T_max_1_engine:
+            # Stage Down 2->1
+            if current_stage_max == 2 and (t - t_last_stage_change) >= min_dwell:
+                if stage_safe_to_drop(1):
                     current_stage_max = 1
+                    t_last_stage_change = t
                     print(
                         f"Stage Down 2->1 at t={t:.2f}, Alt={alt:.1f}m, "
                         f"T_req={T_req_mag/1e3:.1f}kN"
@@ -328,6 +347,20 @@ def simulate_landing_once(
         traj["engines"].append(n_engines)
         
         t += dt_sim
+
+    # If we exited with a small positive altitude, project the final free-fall leg to ground
+    if r[2] > 0.0:
+        gz = g_vec[2]
+        t_ground = estimate_ballistic_time_to_ground(r, v, g_vec, tf_fallback=0.0)
+        if t_ground > 0:
+            r = r + v * t_ground + 0.5 * np.array([0.0, 0.0, gz]) * (t_ground ** 2)
+            v = v + np.array([0.0, 0.0, gz]) * t_ground
+            t += t_ground
+            traj["t"].append(t)
+            traj["r"].append(r.copy())
+            traj["v"].append(v.copy())
+            traj["m"].append(m)
+            traj["engines"].append(0)
 
     # Convert to arrays
     for k in traj:
