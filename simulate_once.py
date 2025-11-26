@@ -8,74 +8,51 @@ from convex_reference import solve_reference_trajectory
 from zem_zev_guidance import ZEMZEVGuidance
 
 
+# ------------------------------------------------------------------
+# 1. HELPER FUNCTIONS (Restored/Preserved)
+# ------------------------------------------------------------------
+
 def estimate_ballistic_time_to_ground(r0, v0, g_vec, tf_fallback=25.0):
     """
     Solve z(t) = z0 + vz0 t + 0.5 gz t^2 = 0 for t > 0.
-
-    If no positive real root exists (e.g. already below ground or going up),
-    fall back to tf_fallback [s].
     """
-    z0 = r0[2]
-    vz0 = v0[2]
-    gz = g_vec[2]
+    z0 = float(r0[2])
+    vz0 = float(v0[2])
+    gz = float(g_vec[2])
 
-    # If already at/below ground or gravity non-downward, fallback
     if z0 <= 0.0 or gz >= 0.0:
         return tf_fallback
 
-    # Quadratic: 0.5*gz*t^2 + vz0*t + z0 = 0
     a = 0.5 * gz
     b = vz0
     c = z0
 
-    # If a ~ 0, treat as linear
     if abs(a) < 1e-9:
         if abs(b) < 1e-9:
-            return tf_fallback  # degenerate, no vertical motion
+            return tf_fallback
         t_lin = -c / b
         return t_lin if t_lin > 0 else tf_fallback
 
     roots = np.roots([a, b, c])
-
-    positive_real_roots = [
-        r.real for r in roots
-        if abs(r.imag) < 1e-6 and r.real > 0
-    ]
+    positive_real_roots = [r.real for r in roots if abs(r.imag) < 1e-6 and r.real > 0]
 
     if not positive_real_roots:
         return tf_fallback
 
-    # Use the *later* impact time (most conservative)
     return max(positive_real_roots)
 
 
-# ----------------------------------------------------------------------
-# Engine allocation and thrust direction
-# ----------------------------------------------------------------------
-
-
-def allocate_engines_stage_limited(
-    T_des_mag,
-    T_engine_max,
-    stage_max_engines,
-    throttle_min=0.4,
-    throttle_max=1.0,
-):
+def allocate_engines(T_des_mag, T_engine_max, max_engines,
+                     throttle_min=0.4, throttle_max=1.0):
     """
-    Given desired total thrust magnitude T_des_mag, choose:
-        - n_engines in {0,1,2,3}, but never exceeding stage_max_engines
-        - T_cmd_mag (actual total thrust)
-
-    Respects per-engine throttle bounds [throttle_min, throttle_max].
+    Choose (n_engines, T_cmd_mag) based on required thrust and max stage.
     """
-    if T_des_mag <= 0.0 or stage_max_engines == 0:
+    if T_des_mag <= 0.0 or max_engines == 0:
         return 0, 0.0
 
-    # Candidate ranges for each engine count up to stage_max_engines
     choices = []
-    for n in (1, 2, 3):
-        if n > stage_max_engines:
-            continue
+    # Only check up to the current max_engines allowed by stage
+    for n in range(1, max_engines + 1):
         T_min_n = n * throttle_min * T_engine_max
         T_max_n = n * throttle_max * T_engine_max
         choices.append((n, T_min_n, T_max_n))
@@ -83,13 +60,11 @@ def allocate_engines_stage_limited(
     if not choices:
         return 0, 0.0
 
-    # 1) Try to find n where T_des lies inside [T_min_n, T_max_n]
+    # 1. Look for a configuration that can exactly match T_des_mag
     feasible = []
     for n, T_min_n, T_max_n in choices:
         if T_min_n <= T_des_mag <= T_max_n:
-            feasible.append(
-                (abs(T_des_mag - 0.5 * (T_min_n + T_max_n)), n, T_min_n, T_max_n)
-            )
+            feasible.append((abs(T_des_mag - 0.5 * (T_min_n + T_max_n)), n, T_min_n, T_max_n))
 
     if feasible:
         feasible.sort()
@@ -97,208 +72,192 @@ def allocate_engines_stage_limited(
         T_cmd = np.clip(T_des_mag, T_min_n, T_max_n)
         return n, T_cmd
 
-    # 2) If T_des is too small for even 1 engine at min:
-    n, T_min_1, _ = choices[0]
-    if T_des_mag < T_min_1:
-        # “Always burning once on”: one engine at minimum
-        return 1, T_min_1
+    # 2. If no exact match, clamp to nearest available
+    n_small, T_min_small, _ = choices[0]
+    if T_des_mag < T_min_small:
+        return n_small, T_min_small # Request is too low, forced to minimum thrust
 
-    # 3) If T_des exceeds max of stage_max_engines, saturate there
-    n, _, T_max_n = choices[-1]
-    return n, T_max_n
+    n_large, _, T_max_last = choices[-1]
+    return n_large, T_max_last # Request is too high, clamped to max thrust
 
 
-def clamp_thrust_direction(a_cmd, m, T_cmd_mag, max_gimbal_deg=20.0):
-    """
-    Convert desired control acceleration a_cmd into a thrust vector
-    with magnitude T_cmd_mag and direction limited to a cone around +Z.
+def allocate_engines_stage_limited(T_des_mag, T_engine_max, stage_max_engines, 
+                                   throttle_min, throttle_max):
+    return allocate_engines(T_des_mag, T_engine_max, stage_max_engines, 
+                            throttle_min, throttle_max)
 
-    T_cmd_mag is already chosen by the engine allocator (0 .. total max).
-    """
-    up = np.array([0.0, 0.0, 1.0])
-
-    # If engines are off
-    if T_cmd_mag <= 0.0 or m <= 0.0:
-        return np.zeros(3)
-
-    # Desired thrust direction from acceleration
-    T_des = m * a_cmd
-    T_norm = np.linalg.norm(T_des)
-    if T_norm < 1e-9:
-        # No clear direction from guidance; just point up
-        direction = up
-    else:
-        dir_des = T_des / T_norm
-        cos_angle = np.clip(np.dot(dir_des, up), -1.0, 1.0)
-        angle = np.arccos(cos_angle)
-
-        max_gimbal_rad = np.radians(max_gimbal_deg)
-        if angle <= max_gimbal_rad:
-            direction = dir_des
-        else:
-            # Project onto cone boundary
-            perp = T_des - np.dot(T_des, up) * up
-            if np.linalg.norm(perp) < 1e-9:
-                direction = up
-            else:
-                perp_unit = perp / np.linalg.norm(perp)
-                direction = (
-                    np.cos(max_gimbal_rad) * up +
-                    np.sin(max_gimbal_rad) * perp_unit
-                )
-                direction /= np.linalg.norm(direction)
-
-    return T_cmd_mag * direction
+def clamp_direction_to_cone(vec, axis, max_angle_deg):
+    axis = np.asarray(axis, dtype=float)
+    axis /= np.linalg.norm(axis)
+    norm = np.linalg.norm(vec)
+    if norm < 1e-9: return np.zeros(3)
+    v = vec / norm
+    cos_ang = np.clip(np.dot(v, axis), -1.0, 1.0)
+    ang = np.arccos(cos_ang)
+    max_ang = np.radians(max_angle_deg)
+    if ang <= max_ang: return vec
+    perp = v - np.dot(v, axis) * axis
+    if np.linalg.norm(perp) < 1e-9: return norm * axis
+    perp /= np.linalg.norm(perp)
+    v_clamped = np.cos(max_ang) * axis + np.sin(max_ang) * perp
+    v_clamped /= np.linalg.norm(v_clamped)
+    return norm * v_clamped
 
 
-# ----------------------------------------------------------------------
-# Main single-run simulation
-# ----------------------------------------------------------------------
+def clamp_thrust_direction(a_cmd, m, T_cmd_mag, gimbal_limit=20.0):
+    if np.linalg.norm(a_cmd) < 1e-6:
+        return np.array([0.0, 0.0, T_cmd_mag]) 
+    T_vec_ideal = (a_cmd / np.linalg.norm(a_cmd)) * T_cmd_mag
+    T_vec_clamped = clamp_direction_to_cone(T_vec_ideal, np.array([0.0, 0.0, 1.0]), gimbal_limit)
+    if np.linalg.norm(T_vec_clamped) > 1e-9:
+        T_vec_clamped = (T_vec_clamped / np.linalg.norm(T_vec_clamped)) * T_cmd_mag
+    return T_vec_clamped
 
+
+# ------------------------------------------------------------------
+# 2. MAIN SIMULATION (With Prediction-Based Staging)
+# ------------------------------------------------------------------
 
 def simulate_landing_once(
     r0,
     v0,
     m0,
-    tf=None,
+    tf=None, 
     N_ref=60,
     dt_sim=0.05,
     freeze_horizontal=True,
 ):
-    """
-    Run one powered landing simulation with convex-guidance + ZEM/ZEV feedback on Mars.
-
-    r0, v0 : initial position and velocity (3,)
-    m0     : initial mass [kg]
-    tf     : final time [s]; if None, chosen from ballistic TOF and
-             refined by the convex solver.
-    freeze_horizontal : if True, switch to vertical-only guidance once
-                        horizontal speed is small.
-    """
     env = get_mars_params()
     g_vec = env["g_vec"]
+    g_mag = np.linalg.norm(g_vec)
 
     r0 = np.array(r0, dtype=float)
     v0 = np.array(v0, dtype=float)
     m0 = float(m0)
 
-    # --- Choose final time tf from ballistic TOF if not given ---
+    # --- 1. Convex Reference (unchanged) ---
     if tf is None:
-        t_ball = estimate_ballistic_time_to_ground(r0, v0, g_vec, tf_fallback=25.0)
-        tf_factor = 1.2  # tweak for aggressiveness
-        tf = tf_factor * t_ball
-        print(f"[simulate] ballistic TOF ~ {t_ball:.2f} s, using tf = {tf:.2f} s")
+        z0 = r0[2]
+        vz0 = v0[2]
+        if vz0 < 0:
+            tf = 1.2 * abs(z0 / vz0) 
+        else:
+            tf = 30.0
 
-    # --- Convex reference trajectory (thrust-feasible, monotonic descent, 3→2→1) ---
+    print(f"[simulate] Initializing guidance with rough tf = {tf:.2f} s")
+
     ref = None
     try:
-        ref = solve_reference_trajectory(
-            r0=r0,
-            v0=v0,
-            g_vec=g_vec,
-            tf=tf,
-            N=N_ref,
-        )
+        ref = solve_reference_trajectory(r0, v0, g_vec, tf, N=N_ref)
     except Exception as e:
-        print(
-            f"[simulate] Warning: convex reference solve failed ({e}). "
-            f"Continuing with ZEM/ZEV only."
-        )
+        print(f"[simulate] Convex solver warning (non-critical): {e}")
 
-    # --- Dynamics and guidance objects ---
+    # --- 2. Setup Dynamics & Guidance (unchanged) ---
     dyn = LanderDynamics(
         g_vec=g_vec,
         isp=330.0,
-        thrust_min=0.0,      # overwritten each step by allocator
-        thrust_max=1.0e9,
+        thrust_min=0.0, 
+        thrust_max=1.0e9, 
         dry_mass=1.2e5,
-        cd_area=90.0,        # ≈ C_d * A for Starship-like shape
-        rho0=0.02,           # surface density on Mars [kg/m^3]
-        h_scale=11000.0,     # scale height [m]
+        cd_area=90.0,
+        rho0=0.02,
+        h_scale=11000.0,
     )
 
     guidance = ZEMZEVGuidance(g_vec=g_vec)
 
-    # --- Engine configuration (Raptor-ish) ---
-    T_ENGINE_MAX = 3.0e6      # N, per engine (~3 MN)
-    THROTTLE_MIN = 0.40       # 40% of full thrust
+    # Engine Config
+    T_ENGINE_MAX = 3.0e6
+    THROTTLE_MIN = 0.40
     THROTTLE_MAX = 1.0
 
-    # --- Horizontal vs vertical phase logic ---
-    horizontal_done = False
-    v_switch_h = 2.0          # m/s: below this, optionally freeze sideways accel
-
-    # --- Simulation state ---
+    # Simulation State
     t = 0.0
     r = r0.copy()
     v = v0.copy()
     m = m0
-
+    
     traj = {"t": [], "r": [], "v": [], "m": [], "engines": []}
-
-    engines_on = False  # hysteresis flag
-
-    # --- Main integration loop ---
-    while t < tf and r[2] > 0.0:
-        t_go = max(tf - t, 0.1)
-
-        # ZEM/ZEV control acceleration toward terminal state (0,0,0)
+    
+    # CONTROL STATES
+    engines_on = False
+    horizontal_done = False
+    current_stage_max = 3 # Stage starts at 3 (max engines) and steps down
+    
+    # --- 3. Main Adaptive Loop ---
+    max_duration = 100.0 
+    
+    while r[2] > 0.1 and t < max_duration:
+        
+        # A. Altitude Definition (FIX: alt was undefined)
+        alt = r[2]
+        
+        # B. Guidance Command (The Prediction)
+        t_go = guidance.compute_tgo(r, v, min_tgo=2.0)
         a_cmd = guidance.compute_accel(r, v, t_go)
+        
+        # C. Required Thrust (The Prediction in physical units)
+        # T_thrust = m*(a_cmd + g)
+        T_req_vec = m * a_cmd - m * g_vec 
+        T_req_mag = np.linalg.norm(T_req_vec)
+        
+        # D. Define Thrust Thresholds (Dynamic based on mass)
+        T_max_2_engines = 2 * THROTTLE_MAX * T_ENGINE_MAX
+        T_max_1_engine = 1 * THROTTLE_MAX * T_ENGINE_MAX
+        T_min_1_engine = 1 * THROTTLE_MIN * T_ENGINE_MAX
+        
+        # E. Engine Staging Logic (Prediction-Based State Machine)
+        
+        # Step 1: Initial Ignition (Free Fall -> Stage 3)
+        if not engines_on:
+            # Ignite if required thrust is > the min thrust of one engine, AND we are falling
+            if T_req_mag > T_min_1_engine * 0.9 and v[2] < -5.0:
+                engines_on = True
+                print(f"Ignition (Stage 3) at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
+                current_stage_max = 3 # Start at 3 engines
 
-        # Horizontal speed
+        # Step 2: Stage Down 
+        if engines_on:
+            if current_stage_max == 3 and alt < 1200.0:
+                # Stage Down 3->2: If required thrust is below the max for 2 engines
+                if T_req_mag < T_max_2_engines * 0.9:
+                    current_stage_max = 2
+                    print(f"Stage Down 3->2 at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
+            
+            if current_stage_max == 2 and alt < 250.0:
+                 # Stage Down 2->1: If required thrust is below the max for 1 engine
+                if T_req_mag < T_max_1_engine * 0.9:
+                    current_stage_max = 1
+                    print(f"Stage Down 2->1 at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
+
+        # Step 3: Final Cutoff
+        if engines_on and alt < 10.0 and np.linalg.norm(v) < 1.0:
+            engines_on = False
+            T_req_mag = 0.0 # Force zero thrust
+
+        # F. Horizontal Freeze Logic
         v_h = np.linalg.norm(v[:2])
-
-        # Optional: Phase 1 (3D) → Phase 2 (vertical only)
         if freeze_horizontal:
-            if horizontal_done:
-                a_cmd = a_cmd.copy()
+            if horizontal_done or v_h < 2.0:
+                horizontal_done = True
                 a_cmd[0] = 0.0
                 a_cmd[1] = 0.0
-            else:
-                if v_h <= v_switch_h:
-                    horizontal_done = True
-                    a_cmd = a_cmd.copy()
-                    a_cmd[0] = 0.0
-                    a_cmd[1] = 0.0
-
-        # --- Engine ON/OFF decision with hysteresis ---
-        if not engines_on:
-            # Ignite when we are low enough and descending fast enough
-            if r[2] < 0.8 * r0[2] and v[2] < -10.0:
-                engines_on = True
-
-        # --- Monotonic descent enforcement (A) ---
-        # Once engines are on, do NOT allow any upward vertical acceleration
-        # that would make v_z positive.
-        if engines_on and a_cmd[2] > 0.0 and v[2] > -1.0:
-            a_cmd = a_cmd.copy()
-            a_cmd[2] = 0.0
-
-        # Desired thrust magnitude from guidance
+        
+        # G. Engine Allocation
         T_des = m * a_cmd
-        T_des_mag = max(0.0, np.linalg.norm(T_des))
+        T_des_mag = np.linalg.norm(T_des) if engines_on else 0.0
 
-        # --- Stage-based engine cap (B: approx 3→2→1 like convex plan) ---
-        # Roughly match the convex scheduling: early: up to 3, middle: 2, late: 1.
-        if t_go > 0.6 * tf:
-            stage_max_engines = 3
-        elif t_go > 0.3 * tf:
-            stage_max_engines = 2
-        else:
-            stage_max_engines = 1
+        n_engines, T_cmd_mag = 0, 0.0
+        if engines_on and current_stage_max > 0:
+             n_engines, T_cmd_mag = allocate_engines_stage_limited(
+                T_des_mag, 
+                T_ENGINE_MAX, 
+                current_stage_max, # Uses the stage determined in (D)
+                THROTTLE_MIN, 
+                THROTTLE_MAX
+             )
 
-        if engines_on:
-            n_engines, T_cmd_mag = allocate_engines_stage_limited(
-                T_des_mag,
-                T_ENGINE_MAX,
-                stage_max_engines=stage_max_engines,
-                throttle_min=THROTTLE_MIN,
-                throttle_max=THROTTLE_MAX,
-            )
-        else:
-            n_engines, T_cmd_mag = 0, 0.0
-
-        # Configure dynamics limits for this step
+        # H. Apply to Dynamics (Set the min/max limits for the dynamics object)
         if n_engines == 0:
             dyn.thrust_min = 0.0
             dyn.thrust_max = 0.0
@@ -306,41 +265,46 @@ def simulate_landing_once(
             dyn.thrust_min = n_engines * THROTTLE_MIN * T_ENGINE_MAX
             dyn.thrust_max = n_engines * THROTTLE_MAX * T_ENGINE_MAX
 
-        # Build thrust vector with proper direction and magnitude
+        # I. Clamp thrust direction
         T_vec = clamp_thrust_direction(a_cmd, m, T_cmd_mag)
 
-        # ----------------------------------------------------
-        # HARD "NO-CLIMB" CLAMP:
-        # If the next vertical velocity would become positive,
-        # scale thrust down so that vz_next ≈ 0 instead.
-        # This guarantees we never accelerate away upward.
-        # ----------------------------------------------------
+        # J. CRITICAL High T/W Throttle Scaling (The Hover-Lock Fix)
+        # Scale thrust back if the minimum throttle would cause upward acceleration.
         if engines_on and m > 0.0:
-            # approximate vertical accel from thrust + gravity (ignore drag)
-            a_z = g_vec[2] + T_vec[2] / m
-            v_z_next = v[2] + a_z * dt_sim
+            # Approximate vertical accel from thrust + gravity (ignore drag)
+            a_z_thrust_only = T_vec[2] / m
+            a_z_actual = g_vec[2] + a_z_thrust_only 
+            
+            # Predict next vertical velocity
+            v_z_next_pred = v[2] + a_z_actual * dt_sim
 
-            if v_z_next > 0.0 and a_z > 0.0:
-                # scale thrust so that v_z_next ≈ 0
-                scale = -v[2] / (a_z * dt_sim)
+            if v_z_next_pred > 0.0 and a_z_thrust_only > 0.0:
+                # Calculate scale factor 's' to set v_z_next_pred ≈ 0
+                scale = -(v[2] + g_vec[2] * dt_sim) / (a_z_thrust_only * dt_sim)
                 scale = np.clip(scale, 0.0, 1.0)
+                
                 T_vec *= scale
-        # ----------------------------------------------------
+                T_cmd_mag = np.linalg.norm(T_vec) # Update actual thrust magnitude
 
-        # Step dynamics
-        (r, v, m), a, saturated = dyn.step((r, v, m), T_vec, dt_sim)
+                # If scaling brought thrust below min-throttle, it means the required T_cmd_mag 
+                # was scaled down to a value that would be below 1 engine's minimum. 
+                # Force n_engines to 0 if the actual thrust is near zero.
+                if T_cmd_mag < T_min_1_engine * 0.1:
+                    n_engines = 0
+                    
+        # K. Step Integration
+        (r, v, m), a_actual, _ = dyn.step((r, v, m), T_vec, dt_sim)
 
-
-        # Store trajectory once per loop
+        # Record
         traj["t"].append(t)
         traj["r"].append(r.copy())
         traj["v"].append(v.copy())
         traj["m"].append(m)
         traj["engines"].append(n_engines)
-
+        
         t += dt_sim
 
-    # Convert lists to arrays
+    # Convert to arrays
     for k in traj:
         traj[k] = np.array(traj[k])
 
@@ -353,7 +317,7 @@ if __name__ == "__main__":
     v0 = np.array([100.0, 0.0, -50.0])
     m0 = 1.5e5
 
-    traj, ref = simulate_landing_once(r0, v0, m0, freeze_horizontal=True)
+    traj, ref = simulate_landing_once(r0, v0, m0)
     print("Sim finished. Final state:")
     print("r:", traj["r"][-1])
     print("v:", traj["v"][-1])
