@@ -182,7 +182,8 @@ def simulate_landing_once(
     # CONTROL STATES
     engines_on = False
     horizontal_done = False
-    current_stage_max = 3 # Stage starts at 3 (max engines) and steps down
+    # Explicit 0-3-2-1 staging
+    current_stage_max = 0  # 0 = free fall, then 3->2->1
     
     # --- 3. Main Adaptive Loop ---
     max_duration = 100.0 
@@ -206,29 +207,55 @@ def simulate_landing_once(
         T_max_1_engine = 1 * THROTTLE_MAX * T_ENGINE_MAX
         T_min_1_engine = 1 * THROTTLE_MIN * T_ENGINE_MAX
         
-        # E. Engine Staging Logic (Prediction-Based State Machine)
-        
-        # Step 1: Initial Ignition (Free Fall -> Stage 3)
-        if not engines_on:
-            # Ignite if required thrust is > the min thrust of one engine, AND we are falling
-            if T_req_mag > T_min_1_engine * 0.9 and v[2] < -5.0:
-                engines_on = True
-                print(f"Ignition (Stage 3) at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
-                current_stage_max = 3 # Start at 3 engines
+        # E. Engine Staging Logic (Explicit 0-3-2-1 profile)
 
-        # Step 2: Stage Down 
+        # Step 1: Initial Ignition (Free Fall -> Stage 3, or 2 if 3 is too much)
+        if not engines_on:
+            # Only consider ignition when we're falling and guidance calls for real thrust
+            t_ballistic = estimate_ballistic_time_to_ground(r, v, g_vec)
+            a_net_max3 = (3 * THROTTLE_MAX * T_ENGINE_MAX) / m + g_vec[2]
+            burn_margin = 1.1
+            t_brake_max3 = (-v[2] / a_net_max3) if a_net_max3 > 1e-6 else np.inf
+
+            # Ignite when we're close enough that a three-engine burn could actually be needed
+            if (
+                T_req_mag > T_min_1_engine * 0.9
+                and v[2] < -5.0
+                and t_ballistic <= burn_margin * t_brake_max3
+            ):
+                preferred_stage = 3
+                T_min_3_engine = 3 * THROTTLE_MIN * T_ENGINE_MAX
+
+                # If three engines at minimum thrust exceed the required thrust, start with two
+                if T_req_mag < 0.95 * T_min_3_engine:
+                    preferred_stage = 2
+
+                engines_on = True
+                current_stage_max = preferred_stage
+                print(
+                    f"Ignition (Stage {preferred_stage}) at t={t:.2f}, Alt={alt:.1f}m, "
+                    f"T_req={T_req_mag/1e3:.1f}kN"
+                )
+
+        # Step 2: Stage Down (3->2->1 only, never back up)
         if engines_on:
-            if current_stage_max == 3 and alt < 1200.0:
-                # Stage Down 3->2: If required thrust is below the max for 2 engines
-                if T_req_mag < T_max_2_engines * 0.9:
+            # Stage Down 3->2: If required thrust is below the comfortable range for 3 engines
+            if current_stage_max == 3:
+                if T_req_mag < 0.85 * T_max_2_engines:
                     current_stage_max = 2
-                    print(f"Stage Down 3->2 at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
-            
-            if current_stage_max == 2 and alt < 250.0:
-                 # Stage Down 2->1: If required thrust is below the max for 1 engine
-                if T_req_mag < T_max_1_engine * 0.9:
+                    print(
+                        f"Stage Down 3->2 at t={t:.2f}, Alt={alt:.1f}m, "
+                        f"T_req={T_req_mag/1e3:.1f}kN"
+                    )
+
+            # Stage Down 2->1: If required thrust is below the comfortable range for 2 engines
+            if current_stage_max == 2:
+                if T_req_mag < 0.90 * T_max_1_engine:
                     current_stage_max = 1
-                    print(f"Stage Down 2->1 at t={t:.2f}, Alt={alt:.1f}m, T_req={T_req_mag/1e3:.1f}kN")
+                    print(
+                        f"Stage Down 2->1 at t={t:.2f}, Alt={alt:.1f}m, "
+                        f"T_req={T_req_mag/1e3:.1f}kN"
+                    )
 
         # Step 3: Final Cutoff
         if engines_on and alt < 10.0 and np.linalg.norm(v) < 1.0:
@@ -249,13 +276,13 @@ def simulate_landing_once(
 
         n_engines, T_cmd_mag = 0, 0.0
         if engines_on and current_stage_max > 0:
-             n_engines, T_cmd_mag = allocate_engines_stage_limited(
-                T_des_mag, 
-                T_ENGINE_MAX, 
+            n_engines, T_cmd_mag = allocate_engines_stage_limited(
+                T_des_mag,
+                T_ENGINE_MAX,
                 current_stage_max, # Uses the stage determined in (D)
-                THROTTLE_MIN, 
-                THROTTLE_MAX
-             )
+                THROTTLE_MIN,
+                THROTTLE_MAX,
+            )
 
         # H. Apply to Dynamics (Set the min/max limits for the dynamics object)
         if n_engines == 0:
