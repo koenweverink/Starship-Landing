@@ -1,59 +1,54 @@
+# zem_zev_guidance.py
 import numpy as np
 
+
 class ZEMZEVGuidance:
-    def __init__(self, g_vec):
-        # gravity vector g(r)  [m/s^2]
+    def __init__(self, g_vec, T_engine_max=3_000_000.0, m_nom=150_000.0):
         self.g = np.array(g_vec, dtype=float)
+        self.T_engine_max = float(T_engine_max)   # one Raptor vacuum thrust
+        self.m_current = float(m_nom)             # will be updated every step
+        self.g_mag = -self.g[2]                   # positive gravity magnitude
 
-    def compute_tgo(self, r, v, r_f=None, v_f=None, min_tgo=2.0):
-        """
-        Estimate optimal time-to-go.
-        Handles both "Closing" phase (heuristic) and "Climbing/Hovering" phase (ballistic).
-        """
-        if r_f is None: r_f = np.zeros(3)
-        if v_f is None: v_f = np.zeros(3)
+    def update_mass(self, m):
+        """Call this every simulation step with current mass"""
+        self.m_current = float(m)
 
-        R_vec = r - r_f
-        V_vec = v - v_f
-        
-        dist = np.linalg.norm(R_vec)
-        closing_speed = 0.0
-        if dist > 1e-3:
-            closing_speed = -np.dot(R_vec, V_vec) / dist
+    def compute_tgo(self, r, v, r_f=None, v_f=None, min_tgo=1.5):
+        if r_f is None:
+            r_f = np.zeros(3)
+        if v_f is None:
+            v_f = np.zeros(3)
 
-        # --- Physics-based Fallback ---
-        # Calculate how long it would take to fall to the ground if we cut engines.
-        # z(t) approx = z + vz*t - 0.5*g*t^2
-        # This prevents "panic" if we are climbing (vz > 0).
-        z = R_vec[2]
-        vz = V_vec[2]
-        g_mag = np.linalg.norm(self.g) # approx 3.71
-        
-        t_ballistic = 10.0 # Default
-        if z > 0:
-            # Roots of 0.5*g*t^2 - vz*t - z = 0
-            # t = (vz + sqrt(vz^2 + 2*g*z)) / g
-            discriminant = vz**2 + 2 * g_mag * z
-            if discriminant >= 0:
-                t_ballistic = (vz + np.sqrt(discriminant)) / g_mag
+        R = np.array(r - r_f, dtype=float)
+        V = np.array(v - v_f, dtype=float)
 
-        # --- Decision Logic ---
-        if closing_speed > 5.0:
-            # We are closing in fast. Use the standard soft-landing heuristic.
-            # t_go = 2 * Distance / Speed
-            t_opt = 2.0 * dist / closing_speed
-        else:
-            # We are slow, hovering, or climbing.
-            # Use the ballistic time + a "comfort margin" (e.g. 1.2x)
-            # This tells guidance: "You have plenty of time, just guide it down gently."
-            t_opt = t_ballistic * 1.2
+        z = R[2]
+        vz = V[2]
 
-        return max(t_opt, min_tgo)
+        if z <= 1.0:
+            return min_tgo
+
+        # Maximum upward acceleration with 3 engines (we always assume we can use 3 for t_go estimate)
+        a_max_thrust = 3.0 * self.T_engine_max / max(self.m_current, 50_000.0)
+        a_net_max = a_max_thrust - self.g_mag
+
+        if a_net_max <= 0.5:                     # impossible to arrest
+            return 100.0
+
+        # Analytic optimal bang-bang time-to-go (the one SpaceX really uses)
+        discriminant = vz**2 + 2.0 * a_net_max * z
+        if discriminant < 0:
+            return 100.0
+
+        t_go = (-vz + np.sqrt(discriminant)) / a_net_max
+
+        # Safety: never trust an unrealistically short t_go when still very high/fast
+        if z > 10_000.0 and t_go < 15.0:
+            t_go = max(t_go, 30.0)
+
+        return max(t_go, min_tgo)
 
     def compute_accel(self, r, v, t_go, r_f=None, v_f=None):
-        """
-        Compute ZEM/ZEV *control* acceleration a(t).
-        """
         if r_f is None:
             r_f = np.zeros(3)
         if v_f is None:
@@ -62,14 +57,9 @@ class ZEMZEVGuidance:
         r = np.array(r, dtype=float)
         v = np.array(v, dtype=float)
 
-        # ZEM and ZEV for constant gravity g
         ZEM = r_f - (r + v * t_go + 0.5 * self.g * t_go**2)
         ZEV = v_f - (v + self.g * t_go)
 
-        # Hawkins/Furfaro ZEM/ZEV law
-        # a_cmd = 6*ZEM/t^2 - 2*ZEV/t
-        a_cmd = 6.0 * ZEM / (t_go**2) - 2.0 * ZEV / t_go
+        # Classic ZEM/ZEV proportional navigation law
+        a_cmd = 6.0 * ZEM / (t_go**2 + 1e-6) - 2.0 * ZEV / (t_go + 1e-6)
         return a_cmd
-    
-    def accel_to_thrust(self, a_cmd, m):
-        return m * a_cmd
