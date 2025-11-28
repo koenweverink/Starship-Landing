@@ -94,7 +94,7 @@ def solve_reference_trajectory(
     objective = cp.Minimize(cp.sum(cp.sum_squares(u)))
 
     prob = cp.Problem(objective, constraints)
-    prob.solve(solver=cp.OSQP, warm_start=True)
+    prob.solve(solver=cp.ECOS, warm_start=True)
 
     if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
         raise RuntimeError(f"Convex solver failed with status {prob.status}")

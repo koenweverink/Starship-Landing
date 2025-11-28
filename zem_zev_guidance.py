@@ -13,7 +13,7 @@ class ZEMZEVGuidance:
         """Call this every simulation step with current mass"""
         self.m_current = float(m)
 
-    def compute_tgo(self, r, v, r_f=None, v_f=None, min_tgo=1.5):
+    def compute_tgo(self, r, v, r_f=None, v_f=None, min_tgo=1.5, n_engines=3):
         if r_f is None:
             r_f = np.zeros(3)
         if v_f is None:
@@ -29,7 +29,7 @@ class ZEMZEVGuidance:
             return min_tgo
 
         # Maximum upward acceleration with 3 engines (we always assume we can use 3 for t_go estimate)
-        a_max_thrust = 3.0 * self.T_engine_max / max(self.m_current, 50_000.0)
+        a_max_thrust = n_engines * self.T_engine_max / max(self.m_current, 50_000.0)
         a_net_max = a_max_thrust - self.g_mag
 
         if a_net_max <= 0.5:                     # impossible to arrest
