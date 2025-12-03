@@ -103,6 +103,7 @@ def simulate_landing_once(
     r = np.array(r0, dtype=float)
     v = np.array(v0, dtype=float)
     m = float(m0)
+    m_initial = m  # for fuel usage metrics
 
     # ---- Engine cluster: 3 engines ----
     N_ENG = 3
@@ -111,7 +112,7 @@ def simulate_landing_once(
     T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # per-engine min thrust [N]
     T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
 
-    # Lateral accel and pseudo-tilt limits
+    # Lateral accel and tilt limits
     A_LAT_MAX = 10.0                     # max lateral accel [m/s^2]
     MAX_TILT_DEG = 35.0
     MAX_TILT_RAD = np.radians(MAX_TILT_DEG)
@@ -119,7 +120,7 @@ def simulate_landing_once(
     dyn = LanderDynamics(
         g_vec=g_vec,
         isp=380.0,
-        thrust_min=0.0,                  # we'll enforce mins in our allocator
+        thrust_min=0.0,                  # we'll enforce mins in allocator
         thrust_max=T_CLUSTER_MAX,
         dry_mass=85_000.0,
         cd_area=120.0,
@@ -129,7 +130,7 @@ def simulate_landing_once(
 
     guidance = ZEMZEVGuidance(
         g_vec=g_vec,
-        T_engine_max=T_E_MAX,            # per-engine, used only for guidance scaling
+        T_engine_max=T_E_MAX,            # per-engine, used for scaling
         m_nom=m0,
     )
 
@@ -140,7 +141,17 @@ def simulate_landing_once(
     ref_interp = None
     tf_ref = None
 
-    traj = {"t": [], "r": [], "v": [], "m": [], "engines": []}
+    traj = {
+        "t": [],
+        "r": [],
+        "v": [],
+        "m": [],
+        "engines": [],
+        # telemetry
+        "g_load": [],
+        "thrust_mag": [],
+        "fuel_used": [],
+    }
 
     while r[2] > 0.05 and t < 300.0:
         alt = r[2]
@@ -148,7 +159,7 @@ def simulate_landing_once(
         v_h_mag = np.linalg.norm(v_h)
         guidance.update_mass(m)
 
-        # ----------------- Ignition logic -----------------
+        # ----------------- Ignition logic (vertical-only) -----------------
         if not engines_on:
             t_ball = ballistic_ttg(r, v, g_vec)
 
@@ -175,13 +186,14 @@ def simulate_landing_once(
                     ref_interp, tf_ref = None, None
 
         n_engines_lit = 0
+        T_vec = np.zeros(3)
 
         # ----------------- Powered guidance & thrust -----------------
         if engines_on:
             v_z = v[2]
             safe_alt = max(alt, 1.0)
 
-            # === Vertical: braking law (unchanged) ===
+            # === Vertical: braking law (baseline) ===
             if v_z < 0.0:
                 a_z_net = (v_z * v_z) / (2.0 * safe_alt)
             else:
@@ -198,8 +210,6 @@ def simulate_landing_once(
             T_z_req = (a_z_net + g_mag) * m
             if T_z_req < 0.0:
                 T_z_req = 0.0
-
-            # Can't exceed total cluster capability
             if T_z_req > T_CLUSTER_MAX:
                 T_z_req = T_CLUSTER_MAX
 
@@ -281,28 +291,57 @@ def simulate_landing_once(
                 T_vec[:] = 0.0
                 engines_on = False
                 n_engines_lit = 0
-        else:
-            T_vec = np.zeros(3)
-            n_engines_lit = 0
 
         # ----------------- Integrate translation -----------------
         dyn.thrust_min = 0.0
         dyn.thrust_max = T_CLUSTER_MAX
 
-        (r, v, m), _, _ = dyn.step((r, v, m), T_vec, dt_sim)
+        (r, v, m), a, _ = dyn.step((r, v, m), T_vec, dt_sim)
+
+        # Telemetry metrics
+        thrust_mag = np.linalg.norm(T_vec)
+        a_mag = np.linalg.norm(a)
+        g_load = a_mag / 9.80665
+        fuel_used = m_initial - m
 
         traj["t"].append(t)
         traj["r"].append(r.copy())
         traj["v"].append(v.copy())
         traj["m"].append(m)
         traj["engines"].append(n_engines_lit)
+        traj["g_load"].append(g_load)
+        traj["thrust_mag"].append(thrust_mag)
+        traj["fuel_used"].append(fuel_used)
 
         t += dt_sim
 
     for k in traj:
         traj[k] = np.array(traj[k])
 
-    return traj
+    # ---------- Summary metrics ----------
+    if len(traj["t"]) > 0:
+        v_final = traj["v"][-1]
+        v_touch_vert = float(v_final[2])
+        v_touch_horiz = float(np.linalg.norm(v_final[:2]))
+        fuel_used_total = float(m_initial - traj["m"][-1])
+        peak_g = float(np.max(traj["g_load"]))
+        max_thrust = float(np.max(traj["thrust_mag"]))
+        min_alt = float(np.min(traj["r"][:, 2]))
+    else:
+        v_touch_vert = v_touch_horiz = fuel_used_total = peak_g = max_thrust = min_alt = 0.0
+
+    summary = {
+        "m0": float(m_initial),
+        "m_final": float(traj["m"][-1]) if len(traj["m"]) > 0 else float(m_initial),
+        "fuel_used_total": fuel_used_total,
+        "v_touch_vertical": v_touch_vert,
+        "v_touch_horizontal": v_touch_horiz,
+        "peak_g_load": peak_g,
+        "max_thrust": max_thrust,
+        "min_altitude": min_alt,
+    }
+
+    return traj, summary
 
 
 # --------------------------------------------------------
@@ -313,22 +352,21 @@ if __name__ == "__main__":
     v0 = np.array([90.0, 0.0, -60.0])
     m0 = 150_000.0
 
-    traj = simulate_landing_once(r0, v0, m0)
+    traj, summary = simulate_landing_once(r0, v0, m0)
 
     import matplotlib.pyplot as plt
-
     t = traj["t"]
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
-    ax[0, 0].plot(t, traj["r"][:, 2])
-    ax[0, 0].set_title("Altitude [m]")
-    ax[0, 1].plot(t, traj["v"][:, 2])
-    ax[0, 1].set_title("Vertical Velocity [m/s]")
-    ax[1, 0].plot(t, np.linalg.norm(traj["v"][:, :2], axis=1))
-    ax[1, 0].set_title("Horizontal Speed [m/s]")
-    ax[1, 1].step(t, traj["engines"], where="post")
-    ax[1, 1].set_title("Engines On (count)")
+    ax[0,0].plot(t, traj["r"][:,2]); ax[0,0].set_title("Altitude [m]")
+    ax[0,1].plot(t, traj["v"][:,2]); ax[0,1].set_title("Vertical Velocity [m/s]")
+    ax[1,0].plot(t, np.linalg.norm(traj["v"][:,:2], axis=1)); ax[1,0].set_title("Horizontal Speed [m/s]")
+    ax[1,1].step(t, traj["engines"], where='post'); ax[1,1].set_title("Engines On (count)")
     plt.tight_layout()
     plt.show()
 
-    print("TOUCHDOWN vertical   :", traj["v"][-1, 2])
-    print("TOUCHDOWN horizontal :", np.linalg.norm(traj["v"][-1, :2]))
+    print("TOUCHDOWN vertical   :", summary["v_touch_vertical"])
+    print("TOUCHDOWN horizontal :", summary["v_touch_horizontal"])
+    print("Fuel used [t]        :", summary["fuel_used_total"] / 1000.0)
+    print("Peak g-load          :", summary["peak_g_load"])
+    print("Max thrust [MN]      :", summary["max_thrust"] / 1e6)
+
