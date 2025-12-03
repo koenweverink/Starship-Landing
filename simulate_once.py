@@ -102,6 +102,9 @@ def simulate_landing_once(
 
     r = np.array(r0, dtype=float)
     v = np.array(v0, dtype=float)
+    # Attitude: quaternion (w,x,y,z) and body rates
+    q = np.array([1.0, 0.0, 0.0, 0.0])
+    w = np.zeros(3)
     m = float(m0)
     m_initial = m  # for fuel usage metrics
 
@@ -145,6 +148,8 @@ def simulate_landing_once(
         "t": [],
         "r": [],
         "v": [],
+        "q": [],
+        "w": [],
         "m": [],
         "engines": [],
         # telemetry
@@ -187,6 +192,7 @@ def simulate_landing_once(
 
         n_engines_lit = 0
         T_vec = np.zeros(3)
+        torque_cmd = np.zeros(3)
 
         # ----------------- Powered guidance & thrust -----------------
         if engines_on:
@@ -296,7 +302,41 @@ def simulate_landing_once(
         dyn.thrust_min = 0.0
         dyn.thrust_max = T_CLUSTER_MAX
 
-        (r, v, m), a, _ = dyn.step((r, v, m), T_vec, dt_sim)
+        # --- 6-DOF attitude control ---
+        if np.linalg.norm(T_vec) > 1e-6:
+            desired_dir = T_vec / np.linalg.norm(T_vec)
+        else:
+            desired_dir = np.array([0.0, 0.0, 1.0])
+
+        # Build desired attitude frame with z-axis along desired thrust
+        z_b_des = desired_dir
+        x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
+        x_b_des = np.cross(x_ref, z_b_des)
+        x_b_norm = np.linalg.norm(x_b_des)
+        if x_b_norm < 1e-6:
+            x_b_des = np.array([1.0, 0.0, 0.0])
+        else:
+            x_b_des /= x_b_norm
+        y_b_des = np.cross(z_b_des, x_b_des)
+
+        R_des = np.column_stack([x_b_des, y_b_des, z_b_des])
+        q_des = dyn.dcm_to_quat(R_des)
+
+        # Quaternion error to torque command
+        q_conj = dyn.quat_conjugate(q)
+        q_err = dyn.quat_multiply(q_des, q_conj)
+        if q_err[0] < 0.0:
+            q_err = -q_err
+        rot_vec = q_err[1:]
+
+        Kp = 5.0e6
+        Kd = 1.0e6
+        torque_cmd = -Kp * rot_vec - Kd * w
+
+        # Thrust expressed in current body frame
+        T_body = dyn.quat_to_dcm(q).T @ T_vec
+
+        (r, v, q, w, m), a, _, _ = dyn.step_6dof((r, v, q, w, m), T_body, torque_cmd, dt_sim)
 
         # Telemetry metrics
         thrust_mag = np.linalg.norm(T_vec)
@@ -307,6 +347,8 @@ def simulate_landing_once(
         traj["t"].append(t)
         traj["r"].append(r.copy())
         traj["v"].append(v.copy())
+        traj["q"].append(q.copy())
+        traj["w"].append(w.copy())
         traj["m"].append(m)
         traj["engines"].append(n_engines_lit)
         traj["g_load"].append(g_load)
