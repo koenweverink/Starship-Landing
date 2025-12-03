@@ -369,8 +369,15 @@ def simulate_landing_once(
         peak_g = float(np.max(traj["g_load"]))
         max_thrust = float(np.max(traj["thrust_mag"]))
         min_alt = float(np.min(traj["r"][:, 2]))
+        # Attitude/aero metrics
+        z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in traj["q"]])
+        tilt_angles = np.degrees(np.arccos(np.clip(z_axes[:, 2], -1.0, 1.0)))
+        peak_tilt_deg = float(np.max(tilt_angles))
+        body_rate_mag = np.linalg.norm(traj["w"], axis=1)
+        peak_body_rate_deg = float(np.max(np.degrees(body_rate_mag)))
     else:
         v_touch_vert = v_touch_horiz = fuel_used_total = peak_g = max_thrust = min_alt = 0.0
+        peak_tilt_deg = peak_body_rate_deg = 0.0
 
     summary = {
         "m0": float(m_initial),
@@ -381,6 +388,8 @@ def simulate_landing_once(
         "peak_g_load": peak_g,
         "max_thrust": max_thrust,
         "min_altitude": min_alt,
+        "peak_tilt_deg": peak_tilt_deg,
+        "peak_body_rate_deg": peak_body_rate_deg,
     }
 
     return traj, summary
@@ -398,11 +407,29 @@ if __name__ == "__main__":
 
     import matplotlib.pyplot as plt
     t = traj["t"]
-    fig, ax = plt.subplots(2, 2, figsize=(12, 8))
-    ax[0,0].plot(t, traj["r"][:,2]); ax[0,0].set_title("Altitude [m]")
-    ax[0,1].plot(t, traj["v"][:,2]); ax[0,1].set_title("Vertical Velocity [m/s]")
-    ax[1,0].plot(t, np.linalg.norm(traj["v"][:,:2], axis=1)); ax[1,0].set_title("Horizontal Speed [m/s]")
-    ax[1,1].step(t, traj["engines"], where='post'); ax[1,1].set_title("Engines On (count)")
+
+    fig, ax = plt.subplots(3, 3, figsize=(14, 10))
+    ax[0, 0].plot(t, traj["r"][:, 2]); ax[0, 0].set_title("Altitude [m]")
+    ax[0, 1].plot(t, traj["v"][:, 2]); ax[0, 1].set_title("Vertical Velocity [m/s]")
+    ax[0, 2].plot(t, np.linalg.norm(traj["v"][:, :2], axis=1)); ax[0, 2].set_title("Horizontal Speed [m/s]")
+
+    ax[1, 0].plot(t, traj["thrust_mag"]); ax[1, 0].set_title("Thrust Magnitude [N]")
+    ax[1, 1].step(t, traj["engines"], where="post"); ax[1, 1].set_title("Engines On (count)")
+    ax[1, 2].plot(t, traj["fuel_used"]); ax[1, 2].set_title("Fuel Used [kg]")
+
+    # Attitude and loads
+    z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in traj["q"]])
+    tilt_deg = np.degrees(np.arccos(np.clip(z_axes[:, 2], -1.0, 1.0)))
+    ax[2, 0].plot(t, tilt_deg); ax[2, 0].set_title("Body Tilt vs. Vertical [deg]")
+
+    rate_mag_deg = np.degrees(np.linalg.norm(traj["w"], axis=1))
+    ax[2, 1].plot(t, rate_mag_deg); ax[2, 1].set_title("Body Rate Magnitude [deg/s]")
+
+    ax[2, 2].plot(t, traj["g_load"]); ax[2, 2].set_title("G-Load")
+
+    for axes in ax.flat:
+        axes.grid(True, linestyle="--", alpha=0.4)
+        axes.set_xlabel("Time [s]")
     plt.tight_layout()
     plt.show()
 
@@ -411,4 +438,6 @@ if __name__ == "__main__":
     print("Fuel used [t]        :", summary["fuel_used_total"] / 1000.0)
     print("Peak g-load          :", summary["peak_g_load"])
     print("Max thrust [MN]      :", summary["max_thrust"] / 1e6)
+    print("Peak tilt [deg]      :", summary["peak_tilt_deg"])
+    print("Peak body rate [deg/s]:", summary["peak_body_rate_deg"])
 
