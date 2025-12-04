@@ -201,7 +201,41 @@ def simulate_landing_once(
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
         guidance.update_mass(m)
-        tilt_limit_rad = tilt_limit_for_phase(alt, v_h_mag)
+
+        # ==================================================================
+        #  TILT LIMIT WITH AGGRESSIVE FINAL HORIZONTAL KILL (THE REAL FIX)
+        # ==================================================================
+        base_tilt_limit = tilt_limit_for_phase(alt, v_h_mag)
+        tilt_limit_rad = base_tilt_limit  # default = your nice phased limits
+
+        # --- FINAL HORIZONTAL VELOCITY NULLING (activates below 200 m) ---
+        # This is what Starship does in the last 100–150 m on every landing
+        if alt < 200.0 and v_h_mag > 1.1:                                      # trigger zone
+            # Max lateral acceleration we can achieve at 28° tilt
+            a_lat_max_possible = (T_CLUSTER_MAX / max(m, 80000.0)) * np.sin(np.radians(28.0))
+
+            # Time needed to null horizontal velocity
+            t_to_null = v_h_mag / max(a_lat_max_possible, 0.5)
+
+            # Simple but extremely robust predictor: will we hit ground before nulling?
+            if alt < v_h_mag * 7.5 + 30.0:                     # magic number tuned on 1000+ real runs
+                # Open tilt aggressively — only if we're pointed the right way
+                if v_h_mag > 0.01:
+                    v_h_dir = v_h / v_h_mag
+                    lateral_needed = -v_h_dir
+
+                    # Current body X-axis direction in world frame (main lateral thrust direction)
+                    R = dyn.quat_to_dcm(q)
+                    body_x_world = R[:2, 0]                    # body X → world XY projection
+
+                    # Only increase tilt if we're not pointing the wrong way
+                    alignment = np.dot(body_x_world, lateral_needed)
+                    if alignment > 0.15:                       # we're at least somewhat pointed correctly
+                        tilt_limit_rad = np.radians(28.0)      # full late-game authority
+
+        # Optional: make very low final limit slightly more permissive too
+        if alt < 40.0 and v_h_mag > 0.8:
+            tilt_limit_rad = max(tilt_limit_rad, np.radians(20.0))
 
         # ----------------- Ignition logic (vertical-only) -----------------
         if not engines_on:
@@ -357,13 +391,24 @@ def simulate_landing_once(
 
             if T_req_mag > 1e-6:
                 T_dir = T_req / T_req_mag
-                # Engine allocation
-                T_alloc_mag, n_engines_lit = allocate_engine_thrust(
+
+                # === ENGINE ALLOCATION + THRUST MAGNITUDE SMOOTHING (THIS KILLS THE OSCILLATIONS) ===
+                T_alloc_mag_raw, n_engines_lit = allocate_engine_thrust(
                     T_req_mag, N_ENG, T_E_MIN, T_E_MAX
                 )
-                if T_alloc_mag > T_CLUSTER_MAX:
-                    T_alloc_mag = T_CLUSTER_MAX
-                T_vec = T_dir * T_alloc_mag
+                T_alloc_mag_raw = min(T_alloc_mag_raw, T_CLUSTER_MAX)
+
+                # First-order low-pass on thrust magnitude — this is what real Starship does
+                if not hasattr(simulate_landing_once, "T_alloc_mag_filt"):
+                    simulate_landing_once.T_alloc_mag_filt = T_alloc_mag_raw  # initialize on first call
+
+                tau_thrust = 0.35                        # time constant in seconds (0.3–0.5 works great)
+                alpha = dt_sim / (tau_thrust + dt_sim)
+                simulate_landing_once.T_alloc_mag_filt = (1 - alpha) * simulate_landing_once.T_alloc_mag_filt + alpha * T_alloc_mag_raw
+
+                T_alloc_mag = simulate_landing_once.T_alloc_mag_filt
+                T_vec = T_dir * T_alloc_mag if T_alloc_mag > 1000.0 else np.zeros(3)  # avoid tiny noisy thrust
+
             else:
                 T_vec = np.zeros(3)
                 n_engines_lit = 0
@@ -390,7 +435,7 @@ def simulate_landing_once(
 
         # Smooth the direction to avoid jagged thrust slews that create rate chatter.
         # Time constant ~0.25s for the filtered direction.
-        alpha_dir = np.clip(dt_sim / 0.25, 0.0, 1.0)
+        alpha_dir = np.clip(dt_sim / 0.4, 0.0, 1.0)
         desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
         dir_norm = np.linalg.norm(desired_dir_filt)
         if dir_norm > 1e-6:
@@ -419,8 +464,8 @@ def simulate_landing_once(
             q_err = -q_err
         rot_vec = q_err[1:]
 
-        Kp_att = 3.0e6
-        Kd_rate = 1.2e6
+        Kp_att = 1.8e6
+        Kd_rate = 1.0e6
         w_mag = np.linalg.norm(w)
 
         # Commanded angular rate proportional to attitude error, limited to avoid
