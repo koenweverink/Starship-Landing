@@ -116,10 +116,10 @@ def simulate_landing_once(
     T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
 
     # Lateral accel, attitude, and body-rate limits
-    A_LAT_MAX = 10.0                     # max lateral accel [m/s^2]
+    A_LAT_MAX = 12.0                     # max lateral accel [m/s^2]
     TILT_HIGH_DEG = 28.0                 # pitch-over cap during early braking
-    TILT_MID_DEG = 24.0                  # aggressive lateral kill mid-phase
-    TILT_LOW_DEG = 18.0                  # stand-up begins
+    TILT_MID_DEG = 26.0                  # aggressive lateral kill mid-phase
+    TILT_LOW_DEG = 20.0                  # stand-up begins
     TILT_FINAL_DEG = 10.0                # stay upright near the ground
     BODY_RATE_LIMIT_DEG = 15.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
@@ -154,7 +154,22 @@ def simulate_landing_once(
         if v_h_speed < 3.0 and altitude < 80.0:
             limit = min(limit, np.radians(8.0))
 
+        # If we're still carrying significant horizontal speed late in the burn,
+        # allow a slight increase in tilt to shed it before stand-up, but cap to
+        # the early pitch-over limit.
+        if altitude < 80.0 and v_h_speed > 5.0:
+            limit = min(np.radians(TILT_HIGH_DEG), max(limit, np.radians(12.0)))
+
         return limit
+
+    def horizontal_speed_cap(altitude):
+        if altitude > 200.0:
+            return 20.0
+        if altitude > 120.0:
+            return 10.0
+        if altitude > 60.0:
+            return 4.0
+        return 1.0
 
     t = 0.0
     engines_on = False
@@ -247,8 +262,8 @@ def simulate_landing_once(
                     # pitch-over: aggressively bleed horizontal speed early in the burn
                     if v_h_mag > 0.2:
                         vhu = v_h / v_h_mag
-                        a_time_const = 12.0
-                        a_side = np.clip(v_h_mag / max(a_time_const, 1.0), 0.5, A_LAT_MAX)
+                        a_time_const = 10.0
+                        a_side = np.clip(v_h_mag / max(a_time_const, 1.0), 0.75, A_LAT_MAX)
                         a_lat_cmd = -a_side * vhu
 
                     if ref_interp is not None:
@@ -260,7 +275,7 @@ def simulate_landing_once(
                         a_net_zem = guidance.compute_accel(r, v, t_go_rem)
                         a_thrust_zem = a_net_zem - g_vec
 
-                        alpha = 0.4
+                        alpha = 0.45
                         blend_cmd = (1 - alpha) * u_ref_t[:2] + alpha * a_thrust_zem[:2]
                         if np.linalg.norm(a_lat_cmd) > 1e-6:
                             a_lat_cmd = 0.5 * a_lat_cmd + 0.5 * blend_cmd
@@ -277,22 +292,35 @@ def simulate_landing_once(
                         a_net_zem = guidance.compute_accel(r, v, t_go_rem)
                         a_thrust_zem = a_net_zem - g_vec
 
-                        alpha = 0.35
+                        alpha = 0.4
                         a_lat_cmd = (1 - alpha) * u_ref_t[:2] + alpha * a_thrust_zem[:2]
                     if v_h_mag > 0.2 and np.linalg.norm(a_lat_cmd) < 1e-6:
                         a_lat_cmd = -min(A_LAT_MAX, v_h_mag) * (v_h / v_h_mag)
                 elif alt > 20.0:
                     # terminal braking: hard lateral kill before stand-up
-                    if v_h_mag > 0.2:
+                    if v_h_mag > 0.15:
                         vhu = v_h / v_h_mag
-                        a_side = min(A_LAT_MAX, max(v_h_mag, 1.0))
+                        a_side = min(A_LAT_MAX, max(v_h_mag * 1.2, 1.5))
                         a_lat_cmd = -a_side * vhu
                 else:
                     # stand-up: keep nearly vertical, only damp residual drift
-                    if v_h_mag > 0.1:
+                    if v_h_mag > 0.08:
                         vhu = v_h / v_h_mag
-                        a_side = np.clip(v_h_mag / 3.0, 0.0, 2.0)
+                        a_side = np.clip(v_h_mag / 2.0, 0.0, 2.5)
                         a_lat_cmd = -a_side * vhu
+
+            # Enforce an altitude-indexed horizontal speed envelope with extra braking
+            v_h_cap = horizontal_speed_cap(alt)
+            if v_h_mag > v_h_cap:
+                vhu = v_h / v_h_mag
+                excess = v_h_mag - v_h_cap
+                tau = np.clip(alt / 40.0, 0.5, 8.0)
+                a_envelope = np.clip(excess / tau, 0.5, A_LAT_MAX)
+                brake_cmd = -a_envelope * vhu
+                if np.linalg.norm(a_lat_cmd) > 1e-6:
+                    a_lat_cmd = 0.5 * a_lat_cmd + 0.5 * brake_cmd
+                else:
+                    a_lat_cmd = brake_cmd
 
             # Limit lateral accel
             a_lat_mag = np.linalg.norm(a_lat_cmd)
