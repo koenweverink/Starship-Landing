@@ -172,6 +172,10 @@ def simulate_landing_once(
         return 1.0
 
     t = 0.0
+
+    # Low-pass the requested thrust/attitude direction to avoid rapid slews that
+    # excite the attitude loop and bang against rate limits.
+    desired_dir_filt = np.array([0.0, 0.0, 1.0])
     engines_on = False
     t_burn_start = None
 
@@ -384,8 +388,18 @@ def simulate_landing_once(
         else:
             desired_dir = np.array([0.0, 0.0, 1.0])
 
+        # Smooth the direction to avoid jagged thrust slews that create rate chatter.
+        # Time constant ~0.25s for the filtered direction.
+        alpha_dir = np.clip(dt_sim / 0.25, 0.0, 1.0)
+        desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
+        dir_norm = np.linalg.norm(desired_dir_filt)
+        if dir_norm > 1e-6:
+            desired_dir_filt /= dir_norm
+        else:
+            desired_dir_filt[:] = desired_dir
+
         # Build desired attitude frame with z-axis along desired thrust
-        z_b_des = desired_dir
+        z_b_des = desired_dir_filt
         x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
         x_b_des = np.cross(x_ref, z_b_des)
         x_b_norm = np.linalg.norm(x_b_des)
@@ -405,27 +419,32 @@ def simulate_landing_once(
             q_err = -q_err
         rot_vec = q_err[1:]
 
-        Kp = 5.0e6
-        Kd = 1.0e6
+        Kp_att = 3.0e6
+        Kd_rate = 1.2e6
         w_mag = np.linalg.norm(w)
-        if w_mag > BODY_RATE_LIMIT_RAD:
-            # Rate saturation: prioritize damping when already too fast
-            torque_cmd = -Kd * w
-        else:
-            torque_cmd = -Kp * rot_vec - Kd * w
 
-            # Predict the rate after this torque and clamp if it would exceed limits
-            w_cross_Jw = np.cross(w, dyn.J * w)
-            w_dot_cmd = (torque_cmd - w_cross_Jw) * dyn.J_inv
-            w_pred = w + w_dot_cmd * dt_sim
-            w_pred_mag = np.linalg.norm(w_pred)
-            if w_pred_mag > BODY_RATE_LIMIT_RAD:
-                w_delta = w_pred - w
-                delta_mag = np.linalg.norm(w_delta)
-                if delta_mag > 1e-9:
-                    scale = max(0.0, (BODY_RATE_LIMIT_RAD - w_mag) / delta_mag)
-                    scale = np.clip(scale, 0.0, 1.0)
-                    torque_cmd *= scale
+        # Commanded angular rate proportional to attitude error, limited to avoid
+        # chatter near the rate ceiling. Bias toward damping when already fast.
+        w_cmd = rot_vec * 0.8
+        w_cmd_mag = np.linalg.norm(w_cmd)
+        if w_cmd_mag > 1e-9:
+            w_cmd *= min(w_cmd_mag, 0.6 * BODY_RATE_LIMIT_RAD) / w_cmd_mag
+
+        if w_mag > BODY_RATE_LIMIT_RAD:
+            # Above the cap: pure damping to wash out excess rate.
+            torque_cmd = -Kd_rate * w
+        else:
+            torque_cmd = -Kp_att * rot_vec - Kd_rate * (w - w_cmd)
+
+        # Predict the rate after this torque and softly scale if it would breach the cap.
+        w_cross_Jw = np.cross(w, dyn.J * w)
+        w_dot_cmd = (torque_cmd - w_cross_Jw) * dyn.J_inv
+        w_pred = w + w_dot_cmd * dt_sim
+        w_pred_mag = np.linalg.norm(w_pred)
+        if w_pred_mag > BODY_RATE_LIMIT_RAD:
+            over = max(w_pred_mag - BODY_RATE_LIMIT_RAD, 0.0)
+            scale = np.clip(1.0 - over / max(w_pred_mag, 1e-6), 0.0, 1.0)
+            torque_cmd *= scale
 
         # Thrust expressed in current body frame
         T_body = dyn.quat_to_dcm(q).T @ T_vec
