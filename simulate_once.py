@@ -115,10 +115,14 @@ def simulate_landing_once(
     T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # per-engine min thrust [N]
     T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
 
-    # Lateral accel and tilt limits
-    A_LAT_MAX = 10.0                     # max lateral accel [m/s^2]
-    MAX_TILT_DEG = 35.0
-    MAX_TILT_RAD = np.radians(MAX_TILT_DEG)
+    # Lateral accel, attitude, and body-rate limits
+    A_LAT_MAX = 12.0                     # max lateral accel [m/s^2]
+    TILT_HIGH_DEG = 28.0                 # pitch-over cap during early braking
+    TILT_MID_DEG = 26.0                  # aggressive lateral kill mid-phase
+    TILT_LOW_DEG = 20.0                  # stand-up begins
+    TILT_FINAL_DEG = 10.0                # stay upright near the ground
+    BODY_RATE_LIMIT_DEG = 15.0
+    BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
 
     dyn = LanderDynamics(
         g_vec=g_vec,
@@ -137,7 +141,41 @@ def simulate_landing_once(
         m_nom=m0,
     )
 
+    def tilt_limit_for_phase(altitude, v_h_speed):
+        if altitude > 300.0:
+            limit = np.radians(TILT_HIGH_DEG)
+        elif altitude > 120.0:
+            limit = np.radians(TILT_MID_DEG)
+        elif altitude > 60.0:
+            limit = np.radians(TILT_LOW_DEG)
+        else:
+            limit = np.radians(TILT_FINAL_DEG)
+
+        if v_h_speed < 3.0 and altitude < 80.0:
+            limit = min(limit, np.radians(8.0))
+
+        # If we're still carrying significant horizontal speed late in the burn,
+        # allow a slight increase in tilt to shed it before stand-up, but cap to
+        # the early pitch-over limit.
+        if altitude < 80.0 and v_h_speed > 5.0:
+            limit = min(np.radians(TILT_HIGH_DEG), max(limit, np.radians(12.0)))
+
+        return limit
+
+    def horizontal_speed_cap(altitude):
+        if altitude > 200.0:
+            return 20.0
+        if altitude > 120.0:
+            return 10.0
+        if altitude > 60.0:
+            return 4.0
+        return 1.0
+
     t = 0.0
+
+    # Low-pass the requested thrust/attitude direction to avoid rapid slews that
+    # excite the attitude loop and bang against rate limits.
+    desired_dir_filt = np.array([0.0, 0.0, 1.0])
     engines_on = False
     t_burn_start = None
 
@@ -163,6 +201,7 @@ def simulate_landing_once(
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
         guidance.update_mass(m)
+        tilt_limit_rad = tilt_limit_for_phase(alt, v_h_mag)
 
         # ----------------- Ignition logic (vertical-only) -----------------
         if not engines_on:
@@ -223,8 +262,14 @@ def simulate_landing_once(
             a_lat_cmd = np.zeros(2)
 
             if freeze_horizontal:
-                if alt > 80.0:
-                    # high phase: convex + ZEM/ZEV blend
+                if alt > 150.0:
+                    # pitch-over: aggressively bleed horizontal speed early in the burn
+                    if v_h_mag > 0.2:
+                        vhu = v_h / v_h_mag
+                        a_time_const = 10.0
+                        a_side = np.clip(v_h_mag / max(a_time_const, 1.0), 0.75, A_LAT_MAX)
+                        a_lat_cmd = -a_side * vhu
+
                     if ref_interp is not None:
                         t_phase = t - t_burn_start
                         _, _, _, u_ref_t = ref_interp(t_phase)
@@ -234,17 +279,52 @@ def simulate_landing_once(
                         a_net_zem = guidance.compute_accel(r, v, t_go_rem)
                         a_thrust_zem = a_net_zem - g_vec
 
-                        alpha = 0.3
+                        alpha = 0.45
+                        blend_cmd = (1 - alpha) * u_ref_t[:2] + alpha * a_thrust_zem[:2]
+                        if np.linalg.norm(a_lat_cmd) > 1e-6:
+                            a_lat_cmd = 0.5 * a_lat_cmd + 0.5 * blend_cmd
+                        else:
+                            a_lat_cmd = blend_cmd
+                elif alt > 80.0:
+                    # mid-phase: still allow tilt but bias toward horizontal kill
+                    if ref_interp is not None:
+                        t_phase = t - t_burn_start
+                        _, _, _, u_ref_t = ref_interp(t_phase)
+                        t_go_rem = tf_ref - t_phase if tf_ref is not None else 15.0
+                        t_go_rem = max(t_go_rem, 5.0)
+
+                        a_net_zem = guidance.compute_accel(r, v, t_go_rem)
+                        a_thrust_zem = a_net_zem - g_vec
+
+                        alpha = 0.4
                         a_lat_cmd = (1 - alpha) * u_ref_t[:2] + alpha * a_thrust_zem[:2]
-                    else:
-                        if v_h_mag > 0.2:
-                            a_lat_cmd = -min(A_LAT_MAX, v_h_mag) * (v_h / v_h_mag)
-                else:
-                    # terminal phase: hard lateral kill
-                    if alt > 20.0 and v_h_mag > 0.2:
+                    if v_h_mag > 0.2 and np.linalg.norm(a_lat_cmd) < 1e-6:
+                        a_lat_cmd = -min(A_LAT_MAX, v_h_mag) * (v_h / v_h_mag)
+                elif alt > 20.0:
+                    # terminal braking: hard lateral kill before stand-up
+                    if v_h_mag > 0.15:
                         vhu = v_h / v_h_mag
-                        a_side = min(A_LAT_MAX, v_h_mag)
+                        a_side = min(A_LAT_MAX, max(v_h_mag * 1.2, 1.5))
                         a_lat_cmd = -a_side * vhu
+                else:
+                    # stand-up: keep nearly vertical, only damp residual drift
+                    if v_h_mag > 0.08:
+                        vhu = v_h / v_h_mag
+                        a_side = np.clip(v_h_mag / 2.0, 0.0, 2.5)
+                        a_lat_cmd = -a_side * vhu
+
+            # Enforce an altitude-indexed horizontal speed envelope with extra braking
+            v_h_cap = horizontal_speed_cap(alt)
+            if v_h_mag > v_h_cap:
+                vhu = v_h / v_h_mag
+                excess = v_h_mag - v_h_cap
+                tau = np.clip(alt / 40.0, 0.5, 8.0)
+                a_envelope = np.clip(excess / tau, 0.5, A_LAT_MAX)
+                brake_cmd = -a_envelope * vhu
+                if np.linalg.norm(a_lat_cmd) > 1e-6:
+                    a_lat_cmd = 0.5 * a_lat_cmd + 0.5 * brake_cmd
+                else:
+                    a_lat_cmd = brake_cmd
 
             # Limit lateral accel
             a_lat_mag = np.linalg.norm(a_lat_cmd)
@@ -257,7 +337,7 @@ def simulate_landing_once(
 
             # Caps on lateral thrust
             F_lat_cap_acc = m * A_LAT_MAX
-            F_lat_cap_tilt = T_z_req * np.tan(MAX_TILT_RAD) if T_z_req > 0.0 else 0.0
+            F_lat_cap_tilt = T_z_req * np.tan(tilt_limit_rad) if T_z_req > 0.0 else 0.0
 
             if T_z_req >= T_CLUSTER_MAX:
                 F_lat_cap_T = 0.0
@@ -308,8 +388,18 @@ def simulate_landing_once(
         else:
             desired_dir = np.array([0.0, 0.0, 1.0])
 
+        # Smooth the direction to avoid jagged thrust slews that create rate chatter.
+        # Time constant ~0.25s for the filtered direction.
+        alpha_dir = np.clip(dt_sim / 0.25, 0.0, 1.0)
+        desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
+        dir_norm = np.linalg.norm(desired_dir_filt)
+        if dir_norm > 1e-6:
+            desired_dir_filt /= dir_norm
+        else:
+            desired_dir_filt[:] = desired_dir
+
         # Build desired attitude frame with z-axis along desired thrust
-        z_b_des = desired_dir
+        z_b_des = desired_dir_filt
         x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
         x_b_des = np.cross(x_ref, z_b_des)
         x_b_norm = np.linalg.norm(x_b_des)
@@ -329,9 +419,32 @@ def simulate_landing_once(
             q_err = -q_err
         rot_vec = q_err[1:]
 
-        Kp = 5.0e6
-        Kd = 1.0e6
-        torque_cmd = -Kp * rot_vec - Kd * w
+        Kp_att = 3.0e6
+        Kd_rate = 1.2e6
+        w_mag = np.linalg.norm(w)
+
+        # Commanded angular rate proportional to attitude error, limited to avoid
+        # chatter near the rate ceiling. Bias toward damping when already fast.
+        w_cmd = rot_vec * 0.8
+        w_cmd_mag = np.linalg.norm(w_cmd)
+        if w_cmd_mag > 1e-9:
+            w_cmd *= min(w_cmd_mag, 0.6 * BODY_RATE_LIMIT_RAD) / w_cmd_mag
+
+        if w_mag > BODY_RATE_LIMIT_RAD:
+            # Above the cap: pure damping to wash out excess rate.
+            torque_cmd = -Kd_rate * w
+        else:
+            torque_cmd = -Kp_att * rot_vec - Kd_rate * (w - w_cmd)
+
+        # Predict the rate after this torque and softly scale if it would breach the cap.
+        w_cross_Jw = np.cross(w, dyn.J * w)
+        w_dot_cmd = (torque_cmd - w_cross_Jw) * dyn.J_inv
+        w_pred = w + w_dot_cmd * dt_sim
+        w_pred_mag = np.linalg.norm(w_pred)
+        if w_pred_mag > BODY_RATE_LIMIT_RAD:
+            over = max(w_pred_mag - BODY_RATE_LIMIT_RAD, 0.0)
+            scale = np.clip(1.0 - over / max(w_pred_mag, 1e-6), 0.0, 1.0)
+            torque_cmd *= scale
 
         # Thrust expressed in current body frame
         T_body = dyn.quat_to_dcm(q).T @ T_vec
