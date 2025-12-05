@@ -102,8 +102,9 @@ def simulate_landing_once(
 
     r = np.array(r0, dtype=float)
     v = np.array(v0, dtype=float)
-    # Attitude: quaternion (w,x,y,z) and body rates
-    q = np.array([1.0, 0.0, 0.0, 0.0])
+    # Attitude: quaternion (w,x,y,z) and body rates. Initialize pitched 90°
+    # around x so the vehicle starts in a horizontal bellyflop orientation.
+    q = np.array([np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0])
     w = np.zeros(3)
     m = float(m0)
     m_initial = m  # for fuel usage metrics
@@ -185,7 +186,7 @@ def simulate_landing_once(
 
     # Low-pass the requested thrust/attitude direction to avoid rapid slews that
     # excite the attitude loop and bang against rate limits.
-    desired_dir_filt = np.array([0.0, 0.0, 1.0])
+    desired_dir_filt = BELLY_ATTITUDE.copy()
     engines_on = False
     t_burn_start = None
     t_flip_start = None
@@ -254,6 +255,7 @@ def simulate_landing_once(
                 t_burn_start = t
                 bellyflop_mode = False
                 t_flip_start = t
+                desired_dir_filt = BELLY_ATTITUDE.copy()
                 print(f"[t={t:.1f}s] ENGINES IGNITED @ {alt:.0f}m")
 
                 tf_guess = max(2.0 * t_stop, 30.0)
