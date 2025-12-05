@@ -589,9 +589,29 @@ def animate_landing(traj, interval_ms=50, save_path=None):
     q_seq = traj["q"]
     t_seq = traj["t"]
 
-    # Pitch angle of the body z-axis in the x-z plane
-    z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in q_seq])
-    theta = np.arctan2(z_axes[:, 0], z_axes[:, 2])
+    # Pitch angle in the x-z plane. When the thrust axis is nearly out-of-plane
+    # (bellyflop), its projection onto the x-z plane vanishes, so fall back to
+    # the body x-axis to keep the rectangle oriented horizontally. Otherwise,
+    # use the body z-axis so an upright ship remains vertical.
+    dcm_seq = np.array([LanderDynamics.quat_to_dcm(q) for q in q_seq])
+    z_axes = dcm_seq[:, :, 2]
+    x_axes = dcm_seq[:, :, 0]
+
+    theta = []
+    for z_b, x_b in zip(z_axes, x_axes):
+        z_proj = np.array([z_b[0], z_b[2]])
+        x_proj = np.array([x_b[0], x_b[2]])
+
+        if np.linalg.norm(z_proj) > 0.25:
+            orient_vec = z_proj
+        elif np.linalg.norm(x_proj) > 1e-6:
+            orient_vec = x_proj
+        else:
+            orient_vec = np.array([0.0, 1.0])
+
+        theta.append(np.arctan2(orient_vec[0], orient_vec[1]))
+
+    theta = np.array(theta)
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.set_title("Starship Entry, Flip, and Landing (x-z plane)")
