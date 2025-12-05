@@ -141,6 +141,16 @@ def simulate_landing_once(
         m_nom=m0,
     )
 
+    # Aerodynamic configurations
+    CD_AREA_BELLY = 280.0                # huge cross-section in bellyflop
+    CD_AREA_VERTICAL = 60.0              # sleeker when standing up
+    dyn.cd_area = CD_AREA_BELLY
+
+    # Entry/flip sequencing
+    BELLY_ATTITUDE = np.array([0.0, 1.0, 0.0])  # keep thrust axis broadside to flow
+    FLIP_BLEND_TIME = 3.0                        # seconds to smoothly rotate upright
+    bellyflop_mode = True
+
     def tilt_limit_for_phase(altitude, v_h_speed):
         if altitude > 300.0:
             limit = np.radians(TILT_HIGH_DEG)
@@ -178,6 +188,7 @@ def simulate_landing_once(
     desired_dir_filt = np.array([0.0, 0.0, 1.0])
     engines_on = False
     t_burn_start = None
+    t_flip_start = None
 
     ref_interp = None
     tf_ref = None
@@ -201,6 +212,9 @@ def simulate_landing_once(
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
         guidance.update_mass(m)
+
+        # Aerodynamic configuration for the current phase
+        dyn.cd_area = CD_AREA_BELLY if bellyflop_mode else CD_AREA_VERTICAL
 
         # ==================================================================
         #  FINAL, FLIGHT-PROVEN TILT LOGIC — 96–99 % SUCCESS RATE
@@ -238,6 +252,8 @@ def simulate_landing_once(
             if t_ball <= 1.05 * t_stop + 4.0:
                 engines_on = True
                 t_burn_start = t
+                bellyflop_mode = False
+                t_flip_start = t
                 print(f"[t={t:.1f}s] ENGINES IGNITED @ {alt:.0f}m")
 
                 tf_guess = max(2.0 * t_stop, 30.0)
@@ -415,8 +431,16 @@ def simulate_landing_once(
         dyn.thrust_max = T_CLUSTER_MAX
 
         # --- 6-DOF attitude control ---
-        if np.linalg.norm(T_vec) > 1e-6:
-            desired_dir = T_vec / np.linalg.norm(T_vec)
+        if bellyflop_mode:
+            desired_dir = BELLY_ATTITUDE
+        elif np.linalg.norm(T_vec) > 1e-6:
+            thrust_dir = T_vec / np.linalg.norm(T_vec)
+            if t_flip_start is not None and (t - t_flip_start) < FLIP_BLEND_TIME:
+                # Blend from belly orientation toward upright as engines light
+                blend = np.clip((t - t_flip_start) / FLIP_BLEND_TIME, 0.0, 1.0)
+                desired_dir = (1.0 - blend) * BELLY_ATTITUDE + blend * thrust_dir
+            else:
+                desired_dir = thrust_dir
         else:
             desired_dir = np.array([0.0, 0.0, 1.0])
 
@@ -541,6 +565,100 @@ def simulate_landing_once(
 
 
 # --------------------------------------------------------
+# Simple 2-D animation helper (x-z plane)
+# --------------------------------------------------------
+def animate_landing(traj, interval_ms=50, save_path=None):
+    """Animate the landing using a rectangle to represent Starship.
+
+    The animation lives in the vertical plane defined by the x- and z-axes.
+    The rectangle is oriented using the vehicle's body z-axis projected onto
+    that plane, giving a clear view of the bellyflop, flip, and touchdown.
+
+    Args:
+        traj: Output dictionary from ``simulate_landing_once``.
+        interval_ms: Delay between frames in milliseconds.
+        save_path: Optional path to save the animation (MP4 or GIF supported
+            by Matplotlib).
+    """
+
+    import matplotlib.pyplot as plt
+    from matplotlib import animation, patches, transforms
+
+    x = traj["r"][:, 0]
+    z = traj["r"][:, 2]
+    q_seq = traj["q"]
+    t_seq = traj["t"]
+
+    # Pitch angle of the body z-axis in the x-z plane
+    z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in q_seq])
+    theta = np.arctan2(z_axes[:, 0], z_axes[:, 2])
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_title("Starship Entry, Flip, and Landing (x-z plane)")
+    x_margin = 40.0
+    z_margin = 80.0
+    ax.set_xlim(min(x) - x_margin, max(x) + x_margin)
+    ax.set_ylim(0.0, max(z) + z_margin)
+    ax.set_xlabel("Downrange x [m]")
+    ax.set_ylabel("Altitude z [m]")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.axhline(0.0, color="dimgray", linewidth=2.0)
+
+    # Rectangle body centered on vehicle position
+    body_height = 50.0
+    body_width = 9.0
+    ship = patches.Rectangle(
+        (-body_width / 2, -body_height / 2),
+        body_width,
+        body_height,
+        linewidth=1.8,
+        edgecolor="#1f77b4",
+        facecolor="#8fc4ff",
+        alpha=0.9,
+    )
+    ax.add_patch(ship)
+
+    path_line, = ax.plot([], [], color="#ff7f0e", linewidth=1.5, alpha=0.8)
+    time_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, fontsize=10)
+    eng_text = ax.text(0.02, 0.90, "", transform=ax.transAxes, fontsize=10)
+
+    def init():
+        ship.set_transform(transforms.Affine2D() + ax.transData)
+        path_line.set_data([], [])
+        time_text.set_text("")
+        eng_text.set_text("")
+        return ship, path_line, time_text, eng_text
+
+    def update(i):
+        xi, zi = x[i], z[i]
+        angle = theta[i]
+        path_line.set_data(x[: i + 1], z[: i + 1])
+
+        trans = transforms.Affine2D().rotate_around(0.0, 0.0, angle).translate(xi, zi)
+        ship.set_transform(trans + ax.transData)
+
+        time_text.set_text(f"t = {t_seq[i]:.1f} s")
+        eng_text.set_text(f"engines: {traj['engines'][i]}")
+        return ship, path_line, time_text, eng_text
+
+    anim = animation.FuncAnimation(
+        fig,
+        update,
+        init_func=init,
+        frames=len(t_seq),
+        interval=interval_ms,
+        blit=True,
+    )
+
+    if save_path:
+        anim.save(save_path)
+    else:
+        plt.show()
+
+    return anim
+
+
+# --------------------------------------------------------
 # Quick test
 # --------------------------------------------------------
 if __name__ == "__main__":
@@ -549,6 +667,12 @@ if __name__ == "__main__":
     m0 = 150_000.0
 
     traj, summary = simulate_landing_once(r0, v0, m0)
+
+    # Visualize the motion with a simple rectangle representing Starship
+    try:
+        animate_landing(traj, interval_ms=60)
+    except Exception as e:
+        print(f"[WARN] Animation failed: {e}")
 
     import matplotlib.pyplot as plt
     t = traj["t"]
