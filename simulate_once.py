@@ -123,6 +123,10 @@ def simulate_landing_once(
     TILT_FINAL_DEG = 10.0                # stay upright near the ground
     BODY_RATE_LIMIT_DEG = 15.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
+    # Attitude authority: small, flap-like trims are possible without engines,
+    # but large slews (the flip) require gimbaled thrust.
+    TORQUE_FLAP_LIMIT = 1.5e5            # aero surfaces, not explicitly modeled here
+    TORQUE_GIMBAL_LIMIT = 3.0e6          # engines lit and gimbaling
 
     dyn = LanderDynamics(
         g_vec=g_vec,
@@ -131,6 +135,7 @@ def simulate_landing_once(
         thrust_max=T_CLUSTER_MAX,
         dry_mass=85_000.0,
         cd_area=120.0,
+        cd_area_belly=240.0,
         rho0=0.020,
         h_scale=11000.0,
     )
@@ -171,9 +176,70 @@ def simulate_landing_once(
             return 4.0
         return 1.0
 
+    def smoothstep01(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
+    def body_tilt_schedule(altitude, engines_on, t_since_burn):
+        """Piecewise body tilt guidance mimicking the requested profile.
+
+        Angles are expressed relative to the *belly-flop* orientation:
+        0°   = belly-flat to the flow
+        40°  = slightly windward into the flow for entry
+        90°  = fully vertical (tail-down) for landing
+        110°+= slight overshoot to smoothly settle upright
+        """
+
+        if not engines_on:
+            if altitude > 1500.0:
+                return np.radians(40.0)
+            if altitude > 800.0:
+                blend = smoothstep01((1500.0 - altitude) / 700.0)
+                return np.radians(40.0 * (1.0 - blend))
+            return 0.0
+
+        # Engines are on: execute the flip with an overshoot to settle softly
+        if t_since_burn is None:
+            return 0.0
+
+        flip_phase = smoothstep01(t_since_burn / 1.0)
+        tilt_cmd = flip_phase * np.radians(115.0)
+
+        settle_phase = smoothstep01((t_since_burn - 1.0) / 1.4)
+        tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
+        return tilt_cmd
+
+    def z_axis_from_tilt(v_vec, tilt_from_belly_rad, windward=True):
+        v_mag = np.linalg.norm(v_vec)
+        if v_mag < 1e-6:
+            return np.array([0.0, 0.0, 1.0])
+
+        v_hat = v_vec / v_mag
+        up = np.array([0.0, 0.0, 1.0])
+
+        flow_dir = -v_hat if windward else v_hat
+        flow_proj = flow_dir - np.dot(flow_dir, up) * up
+        proj_norm = np.linalg.norm(flow_proj)
+        if proj_norm < 1e-6:
+            flow_proj = np.array([1.0, 0.0, 0.0])
+        else:
+            flow_proj /= proj_norm
+
+        # Convert user-facing belly-angle to a tilt measured from vertical.
+        # 0° belly  →  90° from vertical (broadside)
+        # 90° belly →   0° from vertical (upright)
+        tilt_from_vertical = np.radians(90.0) - tilt_from_belly_rad
+
+        z_goal = np.cos(tilt_from_vertical) * up + np.sin(tilt_from_vertical) * flow_proj
+        return z_goal / np.linalg.norm(z_goal)
+
+    def desired_entry_z_axis(r_vec, v_vec, engines_on, t_since_burn):
+        tilt_rad = body_tilt_schedule(r_vec[2], engines_on, t_since_burn)
+        return z_axis_from_tilt(v_vec, tilt_rad)
+
     t = 0.0
 
-    # Low-pass the requested thrust/attitude direction to avoid rapid slews that
+    # Low-pass the requested body z-axis direction to avoid rapid slews that
     # excite the attitude loop and bang against rate limits.
     desired_dir_filt = np.array([0.0, 0.0, 1.0])
     engines_on = False
@@ -200,6 +266,8 @@ def simulate_landing_once(
         alt = r[2]
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
+        t_since_burn = (t - t_burn_start) if (t_burn_start is not None and engines_on) else None
+        aero_z_axis = desired_entry_z_axis(r, v, engines_on, t_since_burn)
         guidance.update_mass(m)
 
         # ==================================================================
@@ -416,21 +484,29 @@ def simulate_landing_once(
 
         # --- 6-DOF attitude control ---
         if np.linalg.norm(T_vec) > 1e-6:
-            desired_dir = T_vec / np.linalg.norm(T_vec)
+            thrust_dir = T_vec / np.linalg.norm(T_vec)
         else:
-            desired_dir = np.array([0.0, 0.0, 1.0])
+            thrust_dir = np.array([0.0, 0.0, 1.0])
+
+        if engines_on:
+            flip_blend = 1.0
+            if t_burn_start is not None:
+                flip_blend = np.clip((t - t_burn_start) / 1.5, 0.0, 1.0)
+            desired_dir = (1.0 - flip_blend) * aero_z_axis + flip_blend * thrust_dir
+        else:
+            desired_dir = aero_z_axis
 
         # Smooth the direction to avoid jagged thrust slews that create rate chatter.
-        # Time constant ~0.25s for the filtered direction.
-        alpha_dir = np.clip(dt_sim / 0.4, 0.0, 1.0)
+        # Time constant ~0.6s for the filtered direction to smooth tilt ramps.
+        alpha_dir = np.clip(dt_sim / 0.6, 0.0, 1.0)
         desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
         dir_norm = np.linalg.norm(desired_dir_filt)
         if dir_norm > 1e-6:
             desired_dir_filt /= dir_norm
         else:
-            desired_dir_filt[:] = desired_dir
+            desired_dir_filt[:] = thrust_dir
 
-        # Build desired attitude frame with z-axis along desired thrust
+        # Build desired attitude frame with z-axis along the target body orientation
         z_b_des = desired_dir_filt
         x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
         x_b_des = np.cross(x_ref, z_b_des)
@@ -457,12 +533,15 @@ def simulate_landing_once(
 
         # Commanded angular rate proportional to attitude error, limited to avoid
         # chatter near the rate ceiling. Bias toward damping when already fast.
+        using_engines_for_torque = engines_on and np.linalg.norm(T_vec) > 1e-3
+        rate_cap = BODY_RATE_LIMIT_RAD if using_engines_for_torque else np.radians(8.0)
+
         w_cmd = rot_vec * 0.8
         w_cmd_mag = np.linalg.norm(w_cmd)
         if w_cmd_mag > 1e-9:
-            w_cmd *= min(w_cmd_mag, 0.6 * BODY_RATE_LIMIT_RAD) / w_cmd_mag
+            w_cmd *= min(w_cmd_mag, 0.6 * rate_cap) / w_cmd_mag
 
-        if w_mag > BODY_RATE_LIMIT_RAD:
+        if w_mag > rate_cap:
             # Above the cap: pure damping to wash out excess rate.
             torque_cmd = -Kd_rate * w
         else:
@@ -473,10 +552,16 @@ def simulate_landing_once(
         w_dot_cmd = (torque_cmd - w_cross_Jw) * dyn.J_inv
         w_pred = w + w_dot_cmd * dt_sim
         w_pred_mag = np.linalg.norm(w_pred)
-        if w_pred_mag > BODY_RATE_LIMIT_RAD:
-            over = max(w_pred_mag - BODY_RATE_LIMIT_RAD, 0.0)
+        if w_pred_mag > rate_cap:
+            over = max(w_pred_mag - rate_cap, 0.0)
             scale = np.clip(1.0 - over / max(w_pred_mag, 1e-6), 0.0, 1.0)
             torque_cmd *= scale
+
+        # Limit torque authority to represent flap trims (coasting) vs gimbaled engines
+        torque_limit = TORQUE_GIMBAL_LIMIT if using_engines_for_torque else TORQUE_FLAP_LIMIT
+        t_mag = np.linalg.norm(torque_cmd)
+        if t_mag > torque_limit > 0.0:
+            torque_cmd *= torque_limit / t_mag
 
         # Thrust expressed in current body frame
         T_body = dyn.quat_to_dcm(q).T @ T_vec
@@ -544,7 +629,7 @@ def simulate_landing_once(
 # Quick test
 # --------------------------------------------------------
 if __name__ == "__main__":
-    r0 = np.array([0.0, 0.0, 2000.0])
+    r0 = np.array([0.0, 0.0, 3000.0])
     v0 = np.array([90.0, 0.0, -60.0])
     m0 = 150_000.0
 

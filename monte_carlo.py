@@ -7,7 +7,7 @@ from simulate_once import simulate_landing_once
 
 def run_monte_carlo(
     N_runs=200,
-    base_alt=2000.0,
+    base_alt=3000.0,
     base_m0=150_000.0,
     v_h_range=(70.0, 110.0),     # initial horizontal speed [m/s]
     v_z_range=(-80.0, -40.0),    # initial vertical speed [m/s] (negative = down)
@@ -165,7 +165,7 @@ def run_monte_carlo(
 if __name__ == "__main__":
     results = run_monte_carlo(
         N_runs=200,
-        base_alt=2000.0,
+        base_alt=3000.0,
         base_m0=150_000.0,
         v_h_range=(70.0, 110.0),
         v_z_range=(-80.0, -40.0),
