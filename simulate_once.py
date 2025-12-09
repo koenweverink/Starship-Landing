@@ -191,10 +191,13 @@ def simulate_landing_once(
         """
 
         if not engines_on:
+            # Hold a deep belly-flop for aero-braking as long as possible.
+            # Stay slightly windward up high, then go nearly broadside well
+            # below 1 km to maximize drag before the flip.
             if altitude > 1500.0:
                 return np.radians(40.0)
-            if altitude > 800.0:
-                blend = smoothstep01((1500.0 - altitude) / 700.0)
+            if altitude > 400.0:
+                blend = smoothstep01((1500.0 - altitude) / 1100.0)
                 return np.radians(40.0 * (1.0 - blend))
             return 0.0
 
@@ -312,8 +315,10 @@ def simulate_landing_once(
 
             t_stop = -v[2] / a_net_max if v[2] < 0.0 else 0.0
 
-            # slightly conservative ignition rule
-            if t_ball <= 1.05 * t_stop + 4.0:
+            # Starship-style late light: let aero braking do the heavy work and
+            # keep engines off until the last safe window for flip/landing.
+            burn_margin = 2.0                          # seconds of cushion
+            if t_ball <= (0.95 * t_stop + burn_margin) and alt < 350.0:
                 engines_on = True
                 t_burn_start = t
                 print(f"[t={t:.1f}s] ENGINES IGNITED @ {alt:.0f}m")
