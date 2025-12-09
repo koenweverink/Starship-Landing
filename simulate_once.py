@@ -123,6 +123,10 @@ def simulate_landing_once(
     TILT_FINAL_DEG = 10.0                # stay upright near the ground
     BODY_RATE_LIMIT_DEG = 15.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
+    # Attitude authority: small, flap-like trims are possible without engines,
+    # but large slews (the flip) require gimbaled thrust.
+    TORQUE_FLAP_LIMIT = 1.5e5            # aero surfaces, not explicitly modeled here
+    TORQUE_GIMBAL_LIMIT = 3.0e6          # engines lit and gimbaling
 
     dyn = LanderDynamics(
         g_vec=g_vec,
@@ -172,8 +176,35 @@ def simulate_landing_once(
             return 4.0
         return 1.0
 
-    def desired_entry_z_axis(r_vec, v_vec):
-        """Return a body z-axis that mimics the belly-first entry profile."""
+    def body_tilt_schedule(altitude, engines_on, t_since_burn):
+        """Piecewise body tilt guidance mimicking the requested profile.
+
+        Angles are measured from the vertical (z-axis up):
+        - ~40° windward entry in upper atmosphere
+        - blend toward a 0° "bellyflop" (belly flat to the ground) as we descend
+        - on ignition, quickly sweep through ~115° then settle to 90° for vertical landing
+        """
+
+        if not engines_on:
+            if altitude > 1500.0:
+                return np.radians(40.0)
+            if altitude > 800.0:
+                blend = np.clip((1500.0 - altitude) / 700.0, 0.0, 1.0)
+                return np.radians(40.0 * (1.0 - blend))
+            return 0.0
+
+        # Engines are on: execute the flip with an overshoot to settle softly
+        if t_since_burn is None:
+            return 0.0
+
+        flip_phase = np.clip(t_since_burn / 1.0, 0.0, 1.0)
+        tilt_cmd = (1.0 - flip_phase) * 0.0 + flip_phase * np.radians(115.0)
+
+        settle_phase = np.clip((t_since_burn - 1.0) / 1.4, 0.0, 1.0)
+        tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
+        return tilt_cmd
+
+    def z_axis_from_tilt(v_vec, tilt_rad, windward=True):
         v_mag = np.linalg.norm(v_vec)
         if v_mag < 1e-6:
             return np.array([0.0, 0.0, 1.0])
@@ -181,29 +212,20 @@ def simulate_landing_once(
         v_hat = v_vec / v_mag
         up = np.array([0.0, 0.0, 1.0])
 
-        # Start by projecting "up" onto the plane perpendicular to velocity so the
-        # body is broadside to the flow (max drag in belly orientation).
-        broadside_z = up - np.dot(up, v_hat) * v_hat
-        broadside_norm = np.linalg.norm(broadside_z)
-        if broadside_norm < 1e-6:
-            broadside_z = np.array([1.0, 0.0, 0.0])
+        flow_dir = -v_hat if windward else v_hat
+        flow_proj = flow_dir - np.dot(flow_dir, up) * up
+        proj_norm = np.linalg.norm(flow_proj)
+        if proj_norm < 1e-6:
+            flow_proj = np.array([1.0, 0.0, 0.0])
         else:
-            broadside_z /= broadside_norm
+            flow_proj /= proj_norm
 
-        # As we descend lower in the atmosphere, roll toward a true "bellyflop"
-        # (horizontal body, vertical velocity) while keeping the windward side
-        # pointed into the flow for stability.
-        flop_axis = np.cross(v_hat, up)
-        if np.linalg.norm(flop_axis) < 1e-6:
-            flop_axis = np.array([1.0, 0.0, 0.0])
-        flop_axis /= np.linalg.norm(flop_axis)
-        flop_z = np.cross(flop_axis, v_hat)
-        flop_z /= np.linalg.norm(flop_z)
+        z_goal = np.cos(tilt_rad) * up + np.sin(tilt_rad) * flow_proj
+        return z_goal / np.linalg.norm(z_goal)
 
-        flop_blend = np.clip((2000.0 - r_vec[2]) / 800.0, 0.0, 1.0)
-        z_goal = (1.0 - flop_blend) * broadside_z + flop_blend * flop_z
-        z_norm = np.linalg.norm(z_goal)
-        return z_goal / z_norm if z_norm > 1e-6 else broadside_z
+    def desired_entry_z_axis(r_vec, v_vec, engines_on, t_since_burn):
+        tilt_rad = body_tilt_schedule(r_vec[2], engines_on, t_since_burn)
+        return z_axis_from_tilt(v_vec, tilt_rad)
 
     t = 0.0
 
@@ -234,7 +256,8 @@ def simulate_landing_once(
         alt = r[2]
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
-        aero_z_axis = desired_entry_z_axis(r, v)
+        t_since_burn = (t - t_burn_start) if (t_burn_start is not None and engines_on) else None
+        aero_z_axis = desired_entry_z_axis(r, v, engines_on, t_since_burn)
         guidance.update_mass(m)
 
         # ==================================================================
@@ -500,12 +523,15 @@ def simulate_landing_once(
 
         # Commanded angular rate proportional to attitude error, limited to avoid
         # chatter near the rate ceiling. Bias toward damping when already fast.
+        using_engines_for_torque = engines_on and np.linalg.norm(T_vec) > 1e-3
+        rate_cap = BODY_RATE_LIMIT_RAD if using_engines_for_torque else np.radians(8.0)
+
         w_cmd = rot_vec * 0.8
         w_cmd_mag = np.linalg.norm(w_cmd)
         if w_cmd_mag > 1e-9:
-            w_cmd *= min(w_cmd_mag, 0.6 * BODY_RATE_LIMIT_RAD) / w_cmd_mag
+            w_cmd *= min(w_cmd_mag, 0.6 * rate_cap) / w_cmd_mag
 
-        if w_mag > BODY_RATE_LIMIT_RAD:
+        if w_mag > rate_cap:
             # Above the cap: pure damping to wash out excess rate.
             torque_cmd = -Kd_rate * w
         else:
@@ -516,10 +542,16 @@ def simulate_landing_once(
         w_dot_cmd = (torque_cmd - w_cross_Jw) * dyn.J_inv
         w_pred = w + w_dot_cmd * dt_sim
         w_pred_mag = np.linalg.norm(w_pred)
-        if w_pred_mag > BODY_RATE_LIMIT_RAD:
-            over = max(w_pred_mag - BODY_RATE_LIMIT_RAD, 0.0)
+        if w_pred_mag > rate_cap:
+            over = max(w_pred_mag - rate_cap, 0.0)
             scale = np.clip(1.0 - over / max(w_pred_mag, 1e-6), 0.0, 1.0)
             torque_cmd *= scale
+
+        # Limit torque authority to represent flap trims (coasting) vs gimbaled engines
+        torque_limit = TORQUE_GIMBAL_LIMIT if using_engines_for_torque else TORQUE_FLAP_LIMIT
+        t_mag = np.linalg.norm(torque_cmd)
+        if t_mag > torque_limit > 0.0:
+            torque_cmd *= torque_limit / t_mag
 
         # Thrust expressed in current body frame
         T_body = dyn.quat_to_dcm(q).T @ T_vec
