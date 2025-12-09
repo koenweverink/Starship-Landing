@@ -1,7 +1,13 @@
 # convex_reference.py
 
+import importlib.util
 import numpy as np
-import cvxpy as cp
+
+CVXPY_AVAILABLE = importlib.util.find_spec("cvxpy") is not None
+if CVXPY_AVAILABLE:
+    import cvxpy as cp
+else:
+    cp = None
 
 
 def solve_reference_trajectory(
@@ -47,6 +53,19 @@ def solve_reference_trajectory(
     g_vec = np.asarray(g_vec, dtype=float)
 
     dt = tf / N
+
+    if not CVXPY_AVAILABLE:
+        # Lightweight fallback: linearly blend toward the ground with finite differences
+        t_ref = np.linspace(0.0, tf, N + 1)
+        r_ref = np.linspace(r0, np.zeros(3), N + 1)
+        v_ref = np.gradient(r_ref, t_ref, axis=0)
+        a_ref = np.gradient(v_ref, t_ref, axis=0) + g_vec
+        return {
+            "t": t_ref,
+            "r": r_ref,
+            "v": v_ref,
+            "a": a_ref,
+        }
 
     # Decision variables
     r = cp.Variable((N + 1, 3))
