@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from simulate_once import simulate_landing_once
 
 if __name__ == "__main__":
-    r0 = np.array([0.0, 0.0, 2000.0])
+    r0 = np.array([0.0, 0.0, 3000.0])
     v0 = np.array([100.0, 0.0, -50.0])
     m0 = 1.5e5
 
