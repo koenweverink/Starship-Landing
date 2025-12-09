@@ -176,6 +176,10 @@ def simulate_landing_once(
             return 4.0
         return 1.0
 
+    def smoothstep01(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
     def body_tilt_schedule(altitude, engines_on, t_since_burn):
         """Piecewise body tilt guidance mimicking the requested profile.
 
@@ -190,7 +194,7 @@ def simulate_landing_once(
             if altitude > 1500.0:
                 return np.radians(40.0)
             if altitude > 800.0:
-                blend = np.clip((1500.0 - altitude) / 700.0, 0.0, 1.0)
+                blend = smoothstep01((1500.0 - altitude) / 700.0)
                 return np.radians(40.0 * (1.0 - blend))
             return 0.0
 
@@ -198,10 +202,10 @@ def simulate_landing_once(
         if t_since_burn is None:
             return 0.0
 
-        flip_phase = np.clip(t_since_burn / 1.0, 0.0, 1.0)
+        flip_phase = smoothstep01(t_since_burn / 1.0)
         tilt_cmd = flip_phase * np.radians(115.0)
 
-        settle_phase = np.clip((t_since_burn - 1.0) / 1.4, 0.0, 1.0)
+        settle_phase = smoothstep01((t_since_burn - 1.0) / 1.4)
         tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
         return tilt_cmd
 
@@ -493,8 +497,8 @@ def simulate_landing_once(
             desired_dir = aero_z_axis
 
         # Smooth the direction to avoid jagged thrust slews that create rate chatter.
-        # Time constant ~0.25s for the filtered direction.
-        alpha_dir = np.clip(dt_sim / 0.4, 0.0, 1.0)
+        # Time constant ~0.6s for the filtered direction to smooth tilt ramps.
+        alpha_dir = np.clip(dt_sim / 0.6, 0.0, 1.0)
         desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
         dir_norm = np.linalg.norm(desired_dir_filt)
         if dir_norm > 1e-6:
