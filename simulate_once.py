@@ -102,8 +102,12 @@ def simulate_landing_once(
 
     r = np.array(r0, dtype=float)
     v = np.array(v0, dtype=float)
-    # Attitude: quaternion (w,x,y,z) and body rates
-    q = np.array([1.0, 0.0, 0.0, 0.0])
+    # Start the vehicle oriented with its belly mostly to the flow instead of
+    # perfectly vertical. This prevents the animation from showing an initial
+    # flip from tail-down to horizontal before the belly-flop guidance takes
+    # over.
+    initial_desired_z = None  # forward-declare so we can also seed the filter
+
     w = np.zeros(3)
     m = float(m0)
     m_initial = m  # for fuel usage metrics
@@ -254,7 +258,23 @@ def simulate_landing_once(
 
     # Low-pass the requested body z-axis direction to avoid rapid slews that
     # excite the attitude loop and bang against rate limits.
-    desired_dir_filt = np.array([0.0, 0.0, 1.0])
+    if initial_desired_z is None:
+        initial_desired_z = desired_entry_z_axis(r, v, engines_on, None)
+
+    desired_dir_filt = initial_desired_z.copy()
+    # Seed the actual body attitude with the same direction so the vehicle
+    # starts already in a belly-to-flow posture.
+    x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(initial_desired_z, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_b_init = np.cross(x_ref, initial_desired_z)
+    x_b_norm = np.linalg.norm(x_b_init)
+    if x_b_norm < 1e-6:
+        x_b_init = np.array([1.0, 0.0, 0.0])
+    else:
+        x_b_init /= x_b_norm
+    y_b_init = np.cross(initial_desired_z, x_b_init)
+
+    R_init = np.column_stack([x_b_init, y_b_init, initial_desired_z])
+    q = dyn.dcm_to_quat(R_init)
     engines_on = False
     t_burn_start = None
 
