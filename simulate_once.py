@@ -514,7 +514,9 @@ def simulate_landing_once(
         peak_g = float(np.max(traj["g_load"]))
         max_thrust = float(np.max(traj["thrust_mag"]))
         min_alt = float(np.min(traj["r"][:, 2]))
-        # Attitude/aero metrics
+        # Attitude/aero metrics (telemetry only; guidance/termination logic does not
+        # require a tilt or body-rate limit check here, but they are helpful for
+        # post-flight envelope verification and plots).
         z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in traj["q"]])
         tilt_angles = np.degrees(np.arccos(np.clip(z_axes[:, 2], -1.0, 1.0)))
         peak_tilt_deg = float(np.max(tilt_angles))
