@@ -179,10 +179,11 @@ def simulate_landing_once(
     def body_tilt_schedule(altitude, engines_on, t_since_burn):
         """Piecewise body tilt guidance mimicking the requested profile.
 
-        Angles are measured from the vertical (z-axis up):
-        - ~40° windward entry in upper atmosphere
-        - blend toward a 0° "bellyflop" (belly flat to the ground) as we descend
-        - on ignition, quickly sweep through ~115° then settle to 90° for vertical landing
+        Angles are expressed relative to the *belly-flop* orientation:
+        0°   = belly-flat to the flow
+        40°  = slightly windward into the flow for entry
+        90°  = fully vertical (tail-down) for landing
+        110°+= slight overshoot to smoothly settle upright
         """
 
         if not engines_on:
@@ -198,13 +199,13 @@ def simulate_landing_once(
             return 0.0
 
         flip_phase = np.clip(t_since_burn / 1.0, 0.0, 1.0)
-        tilt_cmd = (1.0 - flip_phase) * 0.0 + flip_phase * np.radians(115.0)
+        tilt_cmd = flip_phase * np.radians(115.0)
 
         settle_phase = np.clip((t_since_burn - 1.0) / 1.4, 0.0, 1.0)
         tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
         return tilt_cmd
 
-    def z_axis_from_tilt(v_vec, tilt_rad, windward=True):
+    def z_axis_from_tilt(v_vec, tilt_from_belly_rad, windward=True):
         v_mag = np.linalg.norm(v_vec)
         if v_mag < 1e-6:
             return np.array([0.0, 0.0, 1.0])
@@ -220,7 +221,12 @@ def simulate_landing_once(
         else:
             flow_proj /= proj_norm
 
-        z_goal = np.cos(tilt_rad) * up + np.sin(tilt_rad) * flow_proj
+        # Convert user-facing belly-angle to a tilt measured from vertical.
+        # 0° belly  →  90° from vertical (broadside)
+        # 90° belly →   0° from vertical (upright)
+        tilt_from_vertical = np.radians(90.0) - tilt_from_belly_rad
+
+        z_goal = np.cos(tilt_from_vertical) * up + np.sin(tilt_from_vertical) * flow_proj
         return z_goal / np.linalg.norm(z_goal)
 
     def desired_entry_z_axis(r_vec, v_vec, engines_on, t_since_burn):
@@ -619,7 +625,7 @@ def simulate_landing_once(
 # Quick test
 # --------------------------------------------------------
 if __name__ == "__main__":
-    r0 = np.array([0.0, 0.0, 2000.0])
+    r0 = np.array([0.0, 0.0, 3000.0])
     v0 = np.array([90.0, 0.0, -60.0])
     m0 = 150_000.0
 
