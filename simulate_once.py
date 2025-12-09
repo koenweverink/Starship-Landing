@@ -198,14 +198,24 @@ def simulate_landing_once(
                 return np.radians(40.0 * (1.0 - blend))
             return 0.0
 
-        # Engines are on: execute the flip with an overshoot to settle softly
+        # Engines are on: hold a long belly-flop, then flip late like Starship.
         if t_since_burn is None:
             return 0.0
 
-        flip_phase = smoothstep01(t_since_burn / 1.0)
-        tilt_cmd = flip_phase * np.radians(115.0)
+        # Stay nearly horizontal high up to mimic the sustained belly glide.
+        if altitude > 220.0:
+            return np.radians(5.0)
 
-        settle_phase = smoothstep01((t_since_burn - 1.0) / 1.4)
+        # Gently start leaning into the flow as we drop toward flip altitude.
+        if altitude > 120.0:
+            blend = smoothstep01((220.0 - altitude) / 100.0)
+            return np.radians(5.0 + 35.0 * blend)
+
+        # Final flip: time-driven, with a small overshoot that settles upright.
+        flip_phase = smoothstep01(max(t_since_burn - 0.6, 0.0) / 1.2)
+        tilt_cmd = np.radians(40.0) + flip_phase * np.radians(75.0)
+
+        settle_phase = smoothstep01((t_since_burn - 1.8) / 1.2)
         tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
         return tilt_cmd
 
