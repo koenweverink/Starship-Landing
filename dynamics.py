@@ -21,7 +21,7 @@ class LanderDynamics:
         cd_area=0.0,
         rho0=0.02,
         h_scale=11000.0,
-        inertia_diag=(8.0e6, 8.0e6, 4.0e6),
+        inertia_diag=(4500.0, 4500.0, 2500.0),
     ):
         """
         Parameters
