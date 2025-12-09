@@ -10,9 +10,9 @@ def solve_reference_trajectory(
     g_vec,
     tf,
     N=60,
-    a_max_3=25.0,
-    a_max_2=18.0,
-    a_max_1=12.0,
+    a_max_3=18.0,
+    a_max_2=12.0,
+    a_max_1=8.0,
 ):
     """
     Solve a convex guidance problem for powered descent.
@@ -31,9 +31,9 @@ def solve_reference_trajectory(
         - final r_N = 0, v_N = 0
         - z_k is monotonically non-increasing (descent only)
         - ||u_k||_2 <= a_max_stage(k) for each stage:
-            * early: 3 engines  → a_max_3
-            * mid:   2 engines  → a_max_2
-            * late:  1 engine   → a_max_1
+            * early: all engines available   → a_max_3
+            * mid:   throttled / partial set  → a_max_2
+            * late:  single-engine tail       → a_max_1
 
     Objective:
         minimize sum_k ||u_k||_2^2  (quadratic effort)
@@ -58,11 +58,11 @@ def solve_reference_trajectory(
     # Initial conditions
     constraints += [r[0, :] == r0, v[0, :] == v0]
 
-    # Stage-dependent accel bounds (approx 3→2→1 engines)
+    # Stage-dependent accel bounds (early high thrust → mid → late low thrust)
     # We'll split the N steps into 3 segments by index.
-    idx_3_to_2 = int(0.4 * N)   # first 40% of horizon: up to 3 engines
-    idx_2_to_1 = int(0.7 * N)   # next 30%: up to 2 engines
-    # last 30%: up to 1 engine
+    idx_3_to_2 = int(0.4 * N)   # first 40% of horizon: max thrust phase
+    idx_2_to_1 = int(0.7 * N)   # next 30%: throttled/partial engines
+    # last 30%: single-engine tail
 
     for k in range(N):
         # discrete dynamics

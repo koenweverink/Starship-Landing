@@ -108,29 +108,29 @@ def simulate_landing_once(
     m = float(m0)
     m_initial = m  # for fuel usage metrics
 
-    # ---- Engine cluster: 3 engines ----
-    N_ENG = 3
-    T_E_MAX = 1_000_000.0                # per-engine max thrust [N]
-    T_E_MIN_FRAC = 0.4                   # per-engine min throttle
+    # ---- Engine cluster: 4 small throttleable engines ----
+    N_ENG = 4
+    T_E_MAX = 15_000.0                   # per-engine max thrust [N]
+    T_E_MIN_FRAC = 0.2                   # per-engine min throttle
     T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # per-engine min thrust [N]
     T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
 
     # Lateral accel, attitude, and body-rate limits
-    A_LAT_MAX = 12.0                     # max lateral accel [m/s^2]
-    TILT_HIGH_DEG = 28.0                 # pitch-over cap during early braking
-    TILT_MID_DEG = 26.0                  # aggressive lateral kill mid-phase
-    TILT_LOW_DEG = 20.0                  # stand-up begins
+    A_LAT_MAX = 6.0                      # max lateral accel [m/s^2]
+    TILT_HIGH_DEG = 20.0                 # pitch-over cap during early braking
+    TILT_MID_DEG = 18.0                  # aggressive lateral kill mid-phase
+    TILT_LOW_DEG = 14.0                  # stand-up begins
     TILT_FINAL_DEG = 10.0                # stay upright near the ground
-    BODY_RATE_LIMIT_DEG = 15.0
+    BODY_RATE_LIMIT_DEG = 12.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
 
     dyn = LanderDynamics(
         g_vec=g_vec,
-        isp=380.0,
+        isp=320.0,
         thrust_min=0.0,                  # we'll enforce mins in allocator
         thrust_max=T_CLUSTER_MAX,
-        dry_mass=85_000.0,
-        cd_area=120.0,
+        dry_mass=1_200.0,
+        cd_area=15.0,
         rho0=0.020,
         h_scale=11000.0,
     )
@@ -203,16 +203,16 @@ def simulate_landing_once(
         guidance.update_mass(m)
 
         # ==================================================================
-        #  FINAL, FLIGHT-PROVEN TILT LOGIC — 96–99 % SUCCESS RATE
+        #  Tilt logic tuned for a compact Mars lander
         # ==================================================================
         base_tilt_limit = tilt_limit_for_phase(alt, v_h_mag)
         tilt_limit_rad = base_tilt_limit
 
-        # --- AGGRESSIVE HORIZONTAL NULLING: THE REAL STARSHIP LOGIC ---
+        # --- AGGRESSIVE HORIZONTAL NULLING: USE FULL TILT AUTHORITY WHEN NEEDED ---
         if alt < 300.0 and v_h_mag > 0.7:                              # start very early
             # Predicted altitude where we would touch down with current v_h
             # assuming we use maximum possible lateral acceleration from now on
-            a_lat_max = (T_CLUSTER_MAX / max(m, 75000.0)) * np.sin(np.radians(33.0))  # 33° is the real redline
+            a_lat_max = (T_CLUSTER_MAX / max(m, 1500.0)) * np.sin(np.radians(33.0))  # 33° is the real redline
             t_to_null = v_h_mag / max(a_lat_max, 0.5)
             alt_at_null = alt + v[2] * t_to_null + 0.5 * g_vec[2] * t_to_null**2
 
@@ -385,7 +385,7 @@ def simulate_landing_once(
                 )
                 T_alloc_mag_raw = min(T_alloc_mag_raw, T_CLUSTER_MAX)
 
-                # First-order low-pass on thrust magnitude — this is what real Starship does
+                # First-order low-pass on thrust magnitude to avoid large throttle steps
                 if not hasattr(simulate_landing_once, "T_alloc_mag_filt"):
                     simulate_landing_once.T_alloc_mag_filt = T_alloc_mag_raw  # initialize on first call
 
@@ -451,8 +451,8 @@ def simulate_landing_once(
             q_err = -q_err
         rot_vec = q_err[1:]
 
-        Kp_att = 1.8e6
-        Kd_rate = 1.0e6
+        Kp_att = 1.0e3
+        Kd_rate = 6.0e2
         w_mag = np.linalg.norm(w)
 
         # Commanded angular rate proportional to attitude error, limited to avoid
@@ -514,7 +514,9 @@ def simulate_landing_once(
         peak_g = float(np.max(traj["g_load"]))
         max_thrust = float(np.max(traj["thrust_mag"]))
         min_alt = float(np.min(traj["r"][:, 2]))
-        # Attitude/aero metrics
+        # Attitude/aero metrics (telemetry only; guidance/termination logic does not
+        # require a tilt or body-rate limit check here, but they are helpful for
+        # post-flight envelope verification and plots).
         z_axes = np.array([LanderDynamics.quat_to_dcm(q)[:, 2] for q in traj["q"]])
         tilt_angles = np.degrees(np.arccos(np.clip(z_axes[:, 2], -1.0, 1.0)))
         peak_tilt_deg = float(np.max(tilt_angles))
@@ -544,9 +546,9 @@ def simulate_landing_once(
 # Quick test
 # --------------------------------------------------------
 if __name__ == "__main__":
-    r0 = np.array([0.0, 0.0, 2000.0])
-    v0 = np.array([90.0, 0.0, -60.0])
-    m0 = 150_000.0
+    r0 = np.array([0.0, 0.0, 1200.0])
+    v0 = np.array([50.0, 0.0, -35.0])
+    m0 = 2_000.0
 
     traj, summary = simulate_landing_once(r0, v0, m0)
 
