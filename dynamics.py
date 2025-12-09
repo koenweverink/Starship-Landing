@@ -19,6 +19,7 @@ class LanderDynamics:
         thrust_max,
         dry_mass,
         cd_area=0.0,
+        cd_area_belly=None,
         rho0=0.02,
         h_scale=11000.0,
         inertia_diag=(8.0e6, 8.0e6, 4.0e6),
@@ -50,7 +51,8 @@ class LanderDynamics:
         self.dry_mass = float(dry_mass)
 
         # Aerodynamic parameters
-        self.cd_area = float(cd_area)     # C_d * A
+        self.cd_area = float(cd_area)     # C_d * A when aligned nose-first
+        self.cd_area_belly = float(cd_area_belly) if cd_area_belly is not None else float(cd_area)
         self.rho0 = float(rho0)
         self.h_scale = float(h_scale)
 
@@ -149,6 +151,24 @@ class LanderDynamics:
         z_clamped = max(0.0, z)
         return self.rho0 * np.exp(-z_clamped / self.h_scale)
 
+    def _effective_cd_area(self, v_hat, R_body_to_inertial=None):
+        """Return a drag area that depends on attitude relative to the flow.
+
+        When ``R_body_to_inertial`` is provided we blend between the narrow
+        "nose" area and the wider "belly" area based on how perpendicular the
+        body z-axis is to the incoming flow. This creates the classic broadside
+        belly-flop drag profile Starship uses during entry.
+        """
+        if self.cd_area_belly <= 0.0:
+            return 0.0
+
+        if R_body_to_inertial is None:
+            return self.cd_area
+
+        z_body = R_body_to_inertial[:, 2]
+        alignment = abs(np.dot(v_hat, z_body))  # 1 = nose-first, 0 = broadside
+        return self.cd_area_belly + (self.cd_area - self.cd_area_belly) * alignment
+
     # ------------------------------------------------------------------
     # Main dynamics step
     # ------------------------------------------------------------------
@@ -217,12 +237,14 @@ class LanderDynamics:
         # Relative velocity = v (no winds yet)
         rho = self._atmos_density(r[2])
         drag_vec = np.zeros(3)
-        if self.cd_area > 0.0 and rho > 0.0:
+        if self.cd_area_belly > 0.0 and rho > 0.0:
             vmag = np.linalg.norm(v)
             if vmag > 1e-3:
-                # F_d = 0.5 * rho * C_d * A * |v|^2 * (-v_hat)
-                drag_mag = 0.5 * rho * self.cd_area * vmag**2
-                drag_vec = -drag_mag * (v / vmag)
+                # F_d = 0.5 * rho * C_d * A(α) * |v|^2 * (-v_hat)
+                v_hat = v / vmag
+                area_eff = self._effective_cd_area(v_hat)
+                drag_mag = 0.5 * rho * area_eff * vmag**2
+                drag_vec = -drag_mag * v_hat
 
         # ---------------- Acceleration ----------------
         m_eff = max(m, self.dry_mass)
@@ -292,17 +314,21 @@ class LanderDynamics:
             mdot = 0.0
             T_mag = 0.0
 
+        # Body orientation for aerodynamic projection
+        R = self.quat_to_dcm(q)  # body -> inertial
+
         # Aerodynamic drag
         rho = self._atmos_density(r[2])
         drag_vec = np.zeros(3)
-        if self.cd_area > 0.0 and rho > 0.0:
+        if self.cd_area_belly > 0.0 and rho > 0.0:
             vmag = np.linalg.norm(v)
             if vmag > 1e-3:
-                drag_mag = 0.5 * rho * self.cd_area * vmag**2
-                drag_vec = -drag_mag * (v / vmag)
+                v_hat = v / vmag
+                area_eff = self._effective_cd_area(v_hat, R)
+                drag_mag = 0.5 * rho * area_eff * vmag**2
+                drag_vec = -drag_mag * v_hat
 
         # Linear acceleration
-        R = self.quat_to_dcm(q)  # body -> inertial
         thrust_inertial = R @ thrust_body
         m_eff = max(m, self.dry_mass)
         a = self.g + (thrust_inertial + drag_vec) / m_eff

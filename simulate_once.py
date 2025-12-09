@@ -131,6 +131,7 @@ def simulate_landing_once(
         thrust_max=T_CLUSTER_MAX,
         dry_mass=85_000.0,
         cd_area=120.0,
+        cd_area_belly=240.0,
         rho0=0.020,
         h_scale=11000.0,
     )
@@ -171,9 +172,42 @@ def simulate_landing_once(
             return 4.0
         return 1.0
 
+    def desired_entry_z_axis(r_vec, v_vec):
+        """Return a body z-axis that mimics the belly-first entry profile."""
+        v_mag = np.linalg.norm(v_vec)
+        if v_mag < 1e-6:
+            return np.array([0.0, 0.0, 1.0])
+
+        v_hat = v_vec / v_mag
+        up = np.array([0.0, 0.0, 1.0])
+
+        # Start by projecting "up" onto the plane perpendicular to velocity so the
+        # body is broadside to the flow (max drag in belly orientation).
+        broadside_z = up - np.dot(up, v_hat) * v_hat
+        broadside_norm = np.linalg.norm(broadside_z)
+        if broadside_norm < 1e-6:
+            broadside_z = np.array([1.0, 0.0, 0.0])
+        else:
+            broadside_z /= broadside_norm
+
+        # As we descend lower in the atmosphere, roll toward a true "bellyflop"
+        # (horizontal body, vertical velocity) while keeping the windward side
+        # pointed into the flow for stability.
+        flop_axis = np.cross(v_hat, up)
+        if np.linalg.norm(flop_axis) < 1e-6:
+            flop_axis = np.array([1.0, 0.0, 0.0])
+        flop_axis /= np.linalg.norm(flop_axis)
+        flop_z = np.cross(flop_axis, v_hat)
+        flop_z /= np.linalg.norm(flop_z)
+
+        flop_blend = np.clip((2000.0 - r_vec[2]) / 800.0, 0.0, 1.0)
+        z_goal = (1.0 - flop_blend) * broadside_z + flop_blend * flop_z
+        z_norm = np.linalg.norm(z_goal)
+        return z_goal / z_norm if z_norm > 1e-6 else broadside_z
+
     t = 0.0
 
-    # Low-pass the requested thrust/attitude direction to avoid rapid slews that
+    # Low-pass the requested body z-axis direction to avoid rapid slews that
     # excite the attitude loop and bang against rate limits.
     desired_dir_filt = np.array([0.0, 0.0, 1.0])
     engines_on = False
@@ -200,6 +234,7 @@ def simulate_landing_once(
         alt = r[2]
         v_h = v[:2]
         v_h_mag = np.linalg.norm(v_h)
+        aero_z_axis = desired_entry_z_axis(r, v)
         guidance.update_mass(m)
 
         # ==================================================================
@@ -416,9 +451,17 @@ def simulate_landing_once(
 
         # --- 6-DOF attitude control ---
         if np.linalg.norm(T_vec) > 1e-6:
-            desired_dir = T_vec / np.linalg.norm(T_vec)
+            thrust_dir = T_vec / np.linalg.norm(T_vec)
         else:
-            desired_dir = np.array([0.0, 0.0, 1.0])
+            thrust_dir = np.array([0.0, 0.0, 1.0])
+
+        if engines_on:
+            flip_blend = 1.0
+            if t_burn_start is not None:
+                flip_blend = np.clip((t - t_burn_start) / 1.5, 0.0, 1.0)
+            desired_dir = (1.0 - flip_blend) * aero_z_axis + flip_blend * thrust_dir
+        else:
+            desired_dir = aero_z_axis
 
         # Smooth the direction to avoid jagged thrust slews that create rate chatter.
         # Time constant ~0.25s for the filtered direction.
@@ -428,9 +471,9 @@ def simulate_landing_once(
         if dir_norm > 1e-6:
             desired_dir_filt /= dir_norm
         else:
-            desired_dir_filt[:] = desired_dir
+            desired_dir_filt[:] = thrust_dir
 
-        # Build desired attitude frame with z-axis along desired thrust
+        # Build desired attitude frame with z-axis along the target body orientation
         z_b_des = desired_dir_filt
         x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
         x_b_des = np.cross(x_ref, z_b_des)
