@@ -102,8 +102,12 @@ def simulate_landing_once(
 
     r = np.array(r0, dtype=float)
     v = np.array(v0, dtype=float)
-    # Attitude: quaternion (w,x,y,z) and body rates
-    q = np.array([1.0, 0.0, 0.0, 0.0])
+    # Start the vehicle oriented with its belly mostly to the flow instead of
+    # perfectly vertical. This prevents the animation from showing an initial
+    # flip from tail-down to horizontal before the belly-flop guidance takes
+    # over.
+    initial_desired_z = None  # forward-declare so we can also seed the filter
+
     w = np.zeros(3)
     m = float(m0)
     m_initial = m  # for fuel usage metrics
@@ -191,21 +195,34 @@ def simulate_landing_once(
         """
 
         if not engines_on:
+            # Hold a deep belly-flop for aero-braking as long as possible.
+            # Stay slightly windward up high, then go nearly broadside well
+            # below 1 km to maximize drag before the flip.
             if altitude > 1500.0:
                 return np.radians(40.0)
-            if altitude > 800.0:
-                blend = smoothstep01((1500.0 - altitude) / 700.0)
+            if altitude > 400.0:
+                blend = smoothstep01((1500.0 - altitude) / 1100.0)
                 return np.radians(40.0 * (1.0 - blend))
             return 0.0
 
-        # Engines are on: execute the flip with an overshoot to settle softly
+        # Engines are on: hold a long belly-flop, then flip late like Starship.
         if t_since_burn is None:
             return 0.0
 
-        flip_phase = smoothstep01(t_since_burn / 1.0)
-        tilt_cmd = flip_phase * np.radians(115.0)
+        # Stay nearly horizontal high up to mimic the sustained belly glide.
+        if altitude > 220.0:
+            return np.radians(5.0)
 
-        settle_phase = smoothstep01((t_since_burn - 1.0) / 1.4)
+        # Gently start leaning into the flow as we drop toward flip altitude.
+        if altitude > 120.0:
+            blend = smoothstep01((220.0 - altitude) / 100.0)
+            return np.radians(5.0 + 35.0 * blend)
+
+        # Final flip: time-driven, with a small overshoot that settles upright.
+        flip_phase = smoothstep01(max(t_since_burn - 0.6, 0.0) / 1.2)
+        tilt_cmd = np.radians(40.0) + flip_phase * np.radians(75.0)
+
+        settle_phase = smoothstep01((t_since_burn - 1.8) / 1.2)
         tilt_cmd = (1.0 - settle_phase) * tilt_cmd + settle_phase * np.radians(90.0)
         return tilt_cmd
 
@@ -241,7 +258,23 @@ def simulate_landing_once(
 
     # Low-pass the requested body z-axis direction to avoid rapid slews that
     # excite the attitude loop and bang against rate limits.
-    desired_dir_filt = np.array([0.0, 0.0, 1.0])
+    if initial_desired_z is None:
+        initial_desired_z = desired_entry_z_axis(r, v, engines_on, None)
+
+    desired_dir_filt = initial_desired_z.copy()
+    # Seed the actual body attitude with the same direction so the vehicle
+    # starts already in a belly-to-flow posture.
+    x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(initial_desired_z, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_b_init = np.cross(x_ref, initial_desired_z)
+    x_b_norm = np.linalg.norm(x_b_init)
+    if x_b_norm < 1e-6:
+        x_b_init = np.array([1.0, 0.0, 0.0])
+    else:
+        x_b_init /= x_b_norm
+    y_b_init = np.cross(initial_desired_z, x_b_init)
+
+    R_init = np.column_stack([x_b_init, y_b_init, initial_desired_z])
+    q = dyn.dcm_to_quat(R_init)
     engines_on = False
     t_burn_start = None
 
@@ -302,8 +335,10 @@ def simulate_landing_once(
 
             t_stop = -v[2] / a_net_max if v[2] < 0.0 else 0.0
 
-            # slightly conservative ignition rule
-            if t_ball <= 1.05 * t_stop + 4.0:
+            # Starship-style late light: let aero braking do the heavy work and
+            # keep engines off until the last safe window for flip/landing.
+            burn_margin = 2.0                          # seconds of cushion
+            if t_ball <= (0.95 * t_stop + burn_margin) and alt < 350.0:
                 engines_on = True
                 t_burn_start = t
                 print(f"[t={t:.1f}s] ENGINES IGNITED @ {alt:.0f}m")
