@@ -108,25 +108,25 @@ def simulate_landing_once(
     m = float(m0)
     m_initial = m  # for fuel usage metrics
 
-    # ---- Engine cluster: 4 small throttleable engines ----
-    N_ENG = 4
-    T_E_MAX = 15_000.0                   # per-engine max thrust [N]
-    T_E_MIN_FRAC = 0.2                   # per-engine min throttle
-    T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # per-engine min thrust [N]
-    T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
+    # ---- Single throttleable engine ----
+    N_ENG = 1
+    T_E_MAX = 44_000.0                   # engine max thrust [N] (10,000 lbf)
+    T_E_MIN_FRAC = 0.2                   # 20–100% throttle band
+    T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # minimum thrust [N]
+    T_CLUSTER_MAX = N_ENG * T_E_MAX      # single-engine = cluster
 
     # Lateral accel, attitude, and body-rate limits
-    A_LAT_MAX = 6.0                      # max lateral accel [m/s^2]
-    TILT_HIGH_DEG = 20.0                 # pitch-over cap during early braking
-    TILT_MID_DEG = 18.0                  # aggressive lateral kill mid-phase
-    TILT_LOW_DEG = 14.0                  # stand-up begins
-    TILT_FINAL_DEG = 10.0                # stay upright near the ground
+    A_LAT_MAX = 5.0                      # max lateral accel [m/s^2]
+    TILT_HIGH_DEG = 18.0                 # pitch-over cap during early braking
+    TILT_MID_DEG = 15.0                  # aggressive lateral kill mid-phase
+    TILT_LOW_DEG = 10.0                  # stand-up begins
+    TILT_FINAL_DEG = 5.0                 # remain nearly upright near the ground
     BODY_RATE_LIMIT_DEG = 12.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
 
     dyn = LanderDynamics(
         g_vec=g_vec,
-        isp=320.0,
+        isp=460.0,
         thrust_min=0.0,                  # we'll enforce mins in allocator
         thrust_max=T_CLUSTER_MAX,
         dry_mass=1_200.0,
@@ -137,7 +137,7 @@ def simulate_landing_once(
 
     guidance = ZEMZEVGuidance(
         g_vec=g_vec,
-        T_engine_max=T_E_MAX,            # per-engine, used for scaling
+        T_engine_max=T_E_MAX,            # single engine, used for scaling
         m_nom=m0,
     )
 
@@ -148,8 +148,11 @@ def simulate_landing_once(
             limit = np.radians(TILT_MID_DEG)
         elif altitude > 60.0:
             limit = np.radians(TILT_LOW_DEG)
-        else:
+        elif altitude > 20.0:
             limit = np.radians(TILT_FINAL_DEG)
+        else:
+            # Force a stand-up posture very close to the surface
+            limit = np.radians(TILT_FINAL_DEG * 0.6)
 
         if v_h_speed < 3.0 and altitude < 80.0:
             limit = min(limit, np.radians(8.0))
@@ -419,6 +422,11 @@ def simulate_landing_once(
             desired_dir = T_vec / np.linalg.norm(T_vec)
         else:
             desired_dir = np.array([0.0, 0.0, 1.0])
+
+        # Blend toward vertical in the final 20 m to guarantee a straight stand-up
+        if alt < 20.0:
+            blend = np.clip((20.0 - alt) / 20.0, 0.0, 1.0)
+            desired_dir = (1.0 - 0.5 * blend) * desired_dir + 0.5 * blend * np.array([0.0, 0.0, 1.0])
 
         # Smooth the direction to avoid jagged thrust slews that create rate chatter.
         # Time constant ~0.25s for the filtered direction.
