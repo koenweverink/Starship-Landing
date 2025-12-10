@@ -372,6 +372,13 @@ def simulate_landing_once(
             else:
                 F_lat_des[:] = 0.0
 
+            # Stand-up: fade out lateral thrust close to the ground so the vehicle
+            # finishes vertical at touchdown. Below ~12 m, linearly reduce the
+            # lateral component until it is fully zeroed by ~2 m AGL.
+            if alt < 12.0:
+                standup_blend = np.clip((alt - 2.0) / 10.0, 0.0, 1.0)
+                F_lat_des *= standup_blend
+
             # Requested total thrust vector
             T_req = np.array([F_lat_des[0], F_lat_des[1], T_z_req])
             T_req_mag = np.linalg.norm(T_req)
@@ -429,6 +436,10 @@ def simulate_landing_once(
         if alt < 25.0:
             upright_weight = 1.0 - np.clip(alt / 25.0, 0.0, 1.0)
             desired_dir_filt = desired_dir_filt * (1 - upright_weight) + np.array([0,0,1]) * upright_weight
+
+        # Hard clamp to vertical for the last few meters so touchdown is level
+        if alt < 6.0:
+            desired_dir_filt = np.array([0.0, 0.0, 1.0])
 
         # Build desired quaternion (same as yours)
         z_b = desired_dir_filt
