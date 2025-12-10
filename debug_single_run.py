@@ -4,9 +4,9 @@ import matplotlib.pyplot as plt
 from simulate_once import simulate_landing_once
 
 if __name__ == "__main__":
-    r0 = np.array([0.0, 0.0, 2000.0])
-    v0 = np.array([100.0, 0.0, -50.0])
-    m0 = 1.5e5
+    r0 = np.array([0.0, 0.0, 1200.0])
+    v0 = np.array([60.0, 0.0, -35.0])
+    m0 = 2_000.0
 
     traj, ref = simulate_landing_once(r0, v0, m0, freeze_horizontal=True)
 
