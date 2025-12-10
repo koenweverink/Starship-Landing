@@ -108,25 +108,25 @@ def simulate_landing_once(
     m = float(m0)
     m_initial = m  # for fuel usage metrics
 
-    # ---- Single throttleable engine ----
+    # ---- Engine cluster: 4 small throttleable engines ----
     N_ENG = 1
-    T_E_MAX = 44_000.0                   # engine max thrust [N] (10,000 lbf)
-    T_E_MIN_FRAC = 0.2                   # 20–100% throttle band
-    T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # minimum thrust [N]
-    T_CLUSTER_MAX = N_ENG * T_E_MAX      # single-engine = cluster
+    T_E_MAX = 45_000.0                   # per-engine max thrust [N]
+    T_E_MIN_FRAC = 0.2                   # per-engine min throttle
+    T_E_MIN = T_E_MIN_FRAC * T_E_MAX     # per-engine min thrust [N]
+    T_CLUSTER_MAX = N_ENG * T_E_MAX      # cluster max thrust
 
     # Lateral accel, attitude, and body-rate limits
-    A_LAT_MAX = 5.0                      # max lateral accel [m/s^2]
-    TILT_HIGH_DEG = 18.0                 # pitch-over cap during early braking
-    TILT_MID_DEG = 15.0                  # aggressive lateral kill mid-phase
-    TILT_LOW_DEG = 10.0                  # stand-up begins
-    TILT_FINAL_DEG = 5.0                 # remain nearly upright near the ground
+    A_LAT_MAX = 6.0                      # max lateral accel [m/s^2]
+    TILT_HIGH_DEG = 20.0                 # pitch-over cap during early braking
+    TILT_MID_DEG = 18.0                  # aggressive lateral kill mid-phase
+    TILT_LOW_DEG = 14.0                  # stand-up begins
+    TILT_FINAL_DEG = 10.0                # stay upright near the ground
     BODY_RATE_LIMIT_DEG = 12.0
     BODY_RATE_LIMIT_RAD = np.radians(BODY_RATE_LIMIT_DEG)
 
     dyn = LanderDynamics(
         g_vec=g_vec,
-        isp=460.0,
+        isp=320.0,
         thrust_min=0.0,                  # we'll enforce mins in allocator
         thrust_max=T_CLUSTER_MAX,
         dry_mass=1_200.0,
@@ -137,7 +137,7 @@ def simulate_landing_once(
 
     guidance = ZEMZEVGuidance(
         g_vec=g_vec,
-        T_engine_max=T_E_MAX,            # single engine, used for scaling
+        T_engine_max=T_E_MAX,            # per-engine, used for scaling
         m_nom=m0,
     )
 
@@ -148,11 +148,8 @@ def simulate_landing_once(
             limit = np.radians(TILT_MID_DEG)
         elif altitude > 60.0:
             limit = np.radians(TILT_LOW_DEG)
-        elif altitude > 20.0:
-            limit = np.radians(TILT_FINAL_DEG)
         else:
-            # Force a stand-up posture very close to the surface
-            limit = np.radians(TILT_FINAL_DEG * 0.6)
+            limit = np.radians(TILT_FINAL_DEG)
 
         if v_h_speed < 3.0 and altitude < 80.0:
             limit = min(limit, np.radians(8.0))
@@ -418,63 +415,52 @@ def simulate_landing_once(
         dyn.thrust_max = T_CLUSTER_MAX
 
         # --- 6-DOF attitude control ---
-        if np.linalg.norm(T_vec) > 1e-6:
-            desired_dir = T_vec / np.linalg.norm(T_vec)
+        # ─── ATTITUDE CONTROL (much saner gains) ─────────────────────────────────
+        if np.linalg.norm(T_vec) > 100.0:
+            desired_dir_raw = T_vec / np.linalg.norm(T_vec)
         else:
-            desired_dir = np.array([0.0, 0.0, 1.0])
+            desired_dir_raw = np.array([0., 0., 1.0])
 
-        # Blend toward vertical in the final 20 m to guarantee a straight stand-up
-        if alt < 20.0:
-            blend = np.clip((20.0 - alt) / 20.0, 0.0, 1.0)
-            desired_dir = (1.0 - 0.5 * blend) * desired_dir + 0.5 * blend * np.array([0.0, 0.0, 1.0])
+        # Very gentle low-pass on thrust direction (τ ≈ 0.6 s)
+        alpha_dir = dt_sim / (0.6 + dt_sim)
+        desired_dir_filt = (1 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir_raw
 
-        # Smooth the direction to avoid jagged thrust slews that create rate chatter.
-        # Time constant ~0.25s for the filtered direction.
-        alpha_dir = np.clip(dt_sim / 0.4, 0.0, 1.0)
-        desired_dir_filt = (1.0 - alpha_dir) * desired_dir_filt + alpha_dir * desired_dir
-        dir_norm = np.linalg.norm(desired_dir_filt)
-        if dir_norm > 1e-6:
-            desired_dir_filt /= dir_norm
-        else:
-            desired_dir_filt[:] = desired_dir
+        # Force upright below 25 m
+        if alt < 25.0:
+            upright_weight = 1.0 - np.clip(alt / 25.0, 0.0, 1.0)
+            desired_dir_filt = desired_dir_filt * (1 - upright_weight) + np.array([0,0,1]) * upright_weight
 
-        # Build desired attitude frame with z-axis along desired thrust
-        z_b_des = desired_dir_filt
-        x_ref = np.array([1.0, 0.0, 0.0]) if abs(np.dot(z_b_des, [1, 0, 0])) < 0.9 else np.array([0.0, 1.0, 0.0])
-        x_b_des = np.cross(x_ref, z_b_des)
-        x_b_norm = np.linalg.norm(x_b_des)
-        if x_b_norm < 1e-6:
-            x_b_des = np.array([1.0, 0.0, 0.0])
-        else:
-            x_b_des /= x_b_norm
-        y_b_des = np.cross(z_b_des, x_b_des)
-
-        R_des = np.column_stack([x_b_des, y_b_des, z_b_des])
+        # Build desired quaternion (same as yours)
+        z_b = desired_dir_filt
+        x_ref = np.array([1,0,0]) if abs(z_b[0]) < 0.9 else np.array([0,1,0])
+        y_b = np.cross(z_b, x_ref)
+        y_b /= np.linalg.norm(y_b)
+        x_b = np.cross(y_b, z_b)
+        R_des = np.column_stack((x_b, y_b, z_b))
         q_des = dyn.dcm_to_quat(R_des)
 
-        # Quaternion error to torque command
-        q_conj = dyn.quat_conjugate(q)
-        q_err = dyn.quat_multiply(q_des, q_conj)
-        if q_err[0] < 0.0:
+        # Quaternion error
+        q_err = dyn.quat_multiply(q_des, dyn.quat_conjugate(q))
+        if q_err[0] < 0:
             q_err = -q_err
+
+        # Small deadband (0.5° ≈ 0.0087 rad)
         rot_vec = q_err[1:]
-
-        Kp_att = 1.0e3
-        Kd_rate = 6.0e2
-        w_mag = np.linalg.norm(w)
-
-        # Commanded angular rate proportional to attitude error, limited to avoid
-        # chatter near the rate ceiling. Bias toward damping when already fast.
-        w_cmd = rot_vec * 0.8
-        w_cmd_mag = np.linalg.norm(w_cmd)
-        if w_cmd_mag > 1e-9:
-            w_cmd *= min(w_cmd_mag, 0.6 * BODY_RATE_LIMIT_RAD) / w_cmd_mag
-
-        if w_mag > BODY_RATE_LIMIT_RAD:
-            # Above the cap: pure damping to wash out excess rate.
-            torque_cmd = -Kd_rate * w
+        error_mag = np.linalg.norm(rot_vec)
+        if error_mag > 0.0087:
+            rot_vec = rot_vec * (error_mag - 0.0087) / error_mag   # soft deadband
         else:
-            torque_cmd = -Kp_att * rot_vec - Kd_rate * (w - w_cmd)
+            rot_vec = np.zeros(3)
+
+        # Gains that actually work
+        Kp_att  = 120.0
+        Kd_rate = 420.0
+
+        torque_cmd = -Kp_att * rot_vec - Kd_rate * w
+
+        # Simple rate limiting (do not predict, just clamp torque if rate would exceed limit)
+        if np.linalg.norm(w) > np.radians(11.0):        # 11 °/s hard cap
+            torque_cmd = -Kd_rate * w                    # pure damping when saturated
 
         # Predict the rate after this torque and softly scale if it would breach the cap.
         w_cross_Jw = np.cross(w, dyn.J * w)
